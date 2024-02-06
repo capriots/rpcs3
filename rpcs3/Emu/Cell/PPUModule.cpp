@@ -195,6 +195,7 @@ static void ppu_initialize_modules(ppu_linkage_info* link, utils::serial* ar = n
 		&ppu_module_manager::cellCrossController,
 		&ppu_module_manager::cellDaisy,
 		&ppu_module_manager::cellDmux,
+		&ppu_module_manager::cellDmuxPamf,
 		&ppu_module_manager::cellDtcpIpUtility,
 		&ppu_module_manager::cellFiber,
 		&ppu_module_manager::cellFont,

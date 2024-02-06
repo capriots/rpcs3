@@ -117,6 +117,12 @@ class ppu_module_manager final
 		static ppu_static_function* info;
 	};
 
+	template <auto* Var>
+	struct registered_var
+	{
+		static ppu_static_variable* info;
+	};
+
 public:
 	static const ppu_static_module* get_module(const std::string& name);
 
@@ -159,7 +165,15 @@ public:
 		info.flags = 0;
 		info.addr  = 0;
 
+		registered_var<Var>::info = &info;
+
 		return info;
+	}
+
+	template <auto* Var>
+	static auto& find_static_variable()
+	{
+		return *registered_var<Var>::info;
 	}
 
 	// We need this to deal with the enumeration over all ppu_static_modules that happens in ppu_initialize_modules
@@ -179,6 +193,7 @@ public:
 	static const ppu_static_module cellCrossController;
 	static const ppu_static_module cellDaisy;
 	static const ppu_static_module cellDmux;
+	static const ppu_static_module cellDmuxPamf;
 	static const ppu_static_module cellDtcpIpUtility;
 	static const ppu_static_module cellFiber;
 	static const ppu_static_module cellFont;
@@ -281,6 +296,9 @@ public:
 
 template <auto* Func>
 ppu_static_function* ppu_module_manager::registered<Func>::info = nullptr;
+
+template <auto* Var>
+ppu_static_variable* ppu_module_manager::registered_var<Var>::info = nullptr;
 
 // Call specified function directly if LLE is not available, call LLE equivalent in callback style otherwise
 template <auto* Func, typename... Args, typename RT = std::invoke_result_t<decltype(Func), ppu_thread&, Args...>>

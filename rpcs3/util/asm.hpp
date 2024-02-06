@@ -449,6 +449,15 @@ namespace utils
 #endif
 	}
 
+	[[noreturn]] inline void unreachable()
+	{
+#if defined(_MSC_VER)
+		__assume(false);
+#elif defined(__clang__) || defined(__GNUC__)
+		__builtin_unreachable();
+#endif
+	}
+
 	inline void trap()
 	{
 #ifdef _M_X64

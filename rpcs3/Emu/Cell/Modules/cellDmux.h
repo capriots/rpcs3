@@ -1,9 +1,7 @@
 #pragma once
 
-#include "Emu/Memory/vm_ptr.h"
-
 // Error Codes
-enum CellDmuxError :u32
+enum CellDmuxError : u32
 {
 	CELL_DMUX_ERROR_ARG     = 0x80610201,
 	CELL_DMUX_ERROR_SEQ     = 0x80610202,
@@ -32,118 +30,6 @@ enum CellDmuxEsMsgType : s32
 	CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE = 1,
 };
 
-enum CellDmuxPamfM2vLevel : s32
-{
-	CELL_DMUX_PAMF_M2V_MP_LL = 0,
-	CELL_DMUX_PAMF_M2V_MP_ML,
-	CELL_DMUX_PAMF_M2V_MP_H14,
-	CELL_DMUX_PAMF_M2V_MP_HL,
-};
-
-enum CellDmuxPamfAvcLevel : s32
-{
-	CELL_DMUX_PAMF_AVC_LEVEL_2P1 = 21,
-	CELL_DMUX_PAMF_AVC_LEVEL_3P0 = 30,
-	CELL_DMUX_PAMF_AVC_LEVEL_3P1 = 31,
-	CELL_DMUX_PAMF_AVC_LEVEL_3P2 = 32,
-	CELL_DMUX_PAMF_AVC_LEVEL_4P1 = 41,
-	CELL_DMUX_PAMF_AVC_LEVEL_4P2 = 42,
-};
-
-struct CellDmuxPamfAuSpecificInfoM2v
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfAuSpecificInfoAvc
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfAuSpecificInfoLpcm
-{
-	u8 channelAssignmentInfo;
-	u8 samplingFreqInfo;
-	u8 bitsPerSample;
-};
-
-struct CellDmuxPamfAuSpecificInfoAc3
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfAuSpecificInfoAtrac3plus
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfAuSpecificInfoUserData
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfEsSpecificInfoM2v
-{
-	be_t<u32> profileLevel;
-};
-
-struct CellDmuxPamfEsSpecificInfoAvc
-{
-	be_t<u32> level;
-};
-
-struct CellDmuxPamfEsSpecificInfoLpcm
-{
-	be_t<u32> samplingFreq;
-	be_t<u32> numOfChannels;
-	be_t<u32> bitsPerSample;
-};
-
-struct CellDmuxPamfEsSpecificInfoAc3
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfEsSpecificInfoAtrac3plus
-{
-	be_t<u32> reserved1;
-};
-
-struct CellDmuxPamfEsSpecificInfoUserData
-{
-	be_t<u32> reserved1;
-};
-
-enum CellDmuxPamfSamplingFrequency : s32
-{
-	CELL_DMUX_PAMF_FS_48K = 48000,
-};
-
-enum CellDmuxPamfBitsPerSample : s32
-{
-	CELL_DMUX_PAMF_BITS_PER_SAMPLE_16 = 16,
-	CELL_DMUX_PAMF_BITS_PER_SAMPLE_24 = 24,
-};
-
-enum CellDmuxPamfLpcmChannelAssignmentInfo : s32
-{
-	CELL_DMUX_PAMF_LPCM_CH_M1 = 1,
-	CELL_DMUX_PAMF_LPCM_CH_LR = 3,
-	CELL_DMUX_PAMF_LPCM_CH_LRCLSRSLFE = 9,
-	CELL_DMUX_PAMF_LPCM_CH_LRCLSCS1CS2RSLFE = 11,
-};
-
-enum CellDmuxPamfLpcmFs : s32
-{
-	CELL_DMUX_PAMF_LPCM_FS_48K = 1,
-};
-
-enum CellDmuxPamfLpcmBitsPerSamples : s32
-{
-	CELL_DMUX_PAMF_LPCM_BITS_PER_SAMPLE_16 = 1,
-	CELL_DMUX_PAMF_LPCM_BITS_PER_SAMPLE_24 = 3,
-};
-
 struct CellDmuxMsg
 {
 	be_t<s32> msgType; // CellDmuxMsgType
@@ -159,24 +45,19 @@ struct CellDmuxEsMsg
 struct CellDmuxType
 {
 	be_t<s32> streamType; // CellDmuxStreamType
-	be_t<u32> reserved[2];
-};
-
-struct CellDmuxPamfSpecificInfo
-{
-	be_t<u32> thisSize;
-	b8 programEndCodeCb;
+	be_t<s32> reserved1;
+	be_t<s32> reserved2;
 };
 
 struct CellDmuxType2
 {
-	be_t<s32> streamType; // CellDmuxStreamType
-	be_t<u32> streamSpecificInfo;
+	be_t<s32> streamType;
+	vm::bcptr<void> streamSpecificInfo;
 };
 
 struct CellDmuxResource
 {
-	be_t<u32> memAddr;
+	vm::bptr<void> memAddr;
 	be_t<u32> memSize;
 	be_t<u32> ppuThreadPriority;
 	be_t<u32> ppuThreadStackSize;
@@ -186,54 +67,54 @@ struct CellDmuxResource
 
 struct CellDmuxResourceEx
 {
-	be_t<u32> memAddr;
+	vm::bptr<void> memAddr;
 	be_t<u32> memSize;
 	be_t<u32> ppuThreadPriority;
 	be_t<u32> ppuThreadStackSize;
-	be_t<u32> spurs_addr;
-	u8 priority[8];
+	vm::bptr<void> spurs; // CellSpurs*
+	be_t<u64, 1> priority;
 	be_t<u32> maxContention;
 };
 
-/*
-struct CellDmuxResource2Ex
+struct CellDmuxResourceSpurs
 {
-	b8 isResourceEx; //true
-	CellDmuxResourceEx resourceEx;
+	vm::bptr<void> spurs; // CellSpurs*
+	be_t<u64, 1> priority;
+	be_t<u32> maxContention;
 };
-
-struct CellDmuxResource2NoEx
-{
-	b8 isResourceEx; //false
-	CellDmuxResource resource;
-};
-*/
 
 struct CellDmuxResource2
 {
 	b8 isResourceEx;
-	be_t<u32> memAddr;
-	be_t<u32> memSize;
-	be_t<u32> ppuThreadPriority;
-	be_t<u32> ppuThreadStackSize;
-	be_t<u32> shit[4];
+	union
+	{
+		CellDmuxResource resource;
+		CellDmuxResourceEx resourceEx;
+	};
 };
 
-using CellDmuxCbMsg = u32(u32 demuxerHandle, vm::ptr<CellDmuxMsg> demuxerMsg, u32 cbArg);
+struct CellDmuxHandle;
+struct CellDmuxEsHandle;
 
-struct CellDmuxCb
+template <typename F>
+struct DmuxCb
 {
-	vm::bptr<CellDmuxCbMsg> cbMsgFunc;
-	be_t<u32> cbArg;
+	vm::bptr<F> cbFunc;
+	vm::bptr<void> cbArg;
+
+	auto operator()(ppu_thread& ppu, auto&&... args) const
+	{
+		return cbFunc(ppu, std::forward<decltype(args)>(args)..., cbArg);
+	}
 };
 
-using CellDmuxCbEsMsg = u32(u32 demuxerHandle, u32 esHandle, vm::ptr<CellDmuxEsMsg> esMsg, u32 cbArg);
+using CellDmuxCbMsg = u32(vm::ptr<CellDmuxHandle> demuxerHandle, vm::cptr<CellDmuxMsg> demuxerMsg, vm::ptr<void> cbArg);
 
-struct CellDmuxEsCb
-{
-	vm::bptr<CellDmuxCbEsMsg> cbEsMsgFunc;
-	be_t<u32> cbArg;
-};
+using CellDmuxCb = DmuxCb<CellDmuxCbMsg>;
+
+using CellDmuxCbEsMsg = u32(vm::ptr<CellDmuxHandle> demuxerHandle, vm::ptr<CellDmuxEsHandle> esHandle, vm::cptr<CellDmuxEsMsg> esMsg, vm::ptr<void> cbArg);
+
+using CellDmuxEsCb = DmuxCb<CellDmuxCbEsMsg>;
 
 struct CellDmuxAttr
 {
@@ -249,29 +130,136 @@ struct CellDmuxEsAttr
 
 struct CellDmuxEsResource
 {
-	be_t<u32> memAddr;
+	vm::bptr<void> memAddr;
 	be_t<u32> memSize;
 };
 
 struct CellDmuxAuInfo
 {
-	be_t<u32> auAddr;
+	vm::bptr<void> auAddr;
 	be_t<u32> auSize;
 	be_t<u32> auMaxSize;
-	be_t<u64> userData;
-	be_t<u32> ptsUpper;
-	be_t<u32> ptsLower;
-	be_t<u32> dtsUpper;
-	be_t<u32> dtsLower;
-};
-
-struct CellDmuxAuInfoEx
-{
-	be_t<u32> auAddr;
-	be_t<u32> auSize;
-	be_t<u32> reserved;
 	b8 isRap;
 	be_t<u64> userData;
 	CellCodecTimeStamp pts;
 	CellCodecTimeStamp dts;
+};
+
+typedef CellDmuxAuInfo CellDmuxAuInfoEx;
+
+struct DmuxAuInfo
+{
+	CellDmuxAuInfo info;
+	vm::bptr<void> specific_info;
+	be_t<u32> specific_info_size;
+};
+
+struct DmuxAuQueueData
+{
+	be_t<u32> index;
+	u8 unk; // unused
+	DmuxAuInfo au_info;
+};
+
+CHECK_SIZE(DmuxAuQueueData, 0x38);
+
+struct CellDmuxEsHandle;
+
+enum
+{
+	DMUX_STOPPED = 1 << 0,
+	DMUX_IN_PROGRESS = 1 << 1,
+};
+
+struct alignas(0x10) CellDmuxHandle
+{
+	vm::bptr<CellDmuxHandle> _this;
+	be_t<u32> _this_size;
+	be_t<u32> version1;
+	be_t<u32> dmux_status;
+	CellDmuxType dmux_type;
+	CellDmuxCb dmux_cb;
+	b8 stream_is_set;
+	vm::bptr<void> core_handle;
+	be_t<u32> version2;
+	be_t<u64> user_data;
+	be_t<s32> max_enabled_es_num;
+	be_t<s32> enabled_es_num;
+	shared_mutex _dx_mhd; // sys_mutex_t
+	u8 reserved[0x7c];
+	vm::bptr<CellDmuxEsHandle> es_handles[0x40];
+};
+
+CHECK_SIZE_ALIGN(CellDmuxHandle, 0x1c0, 0x10);
+
+struct alignas(0x10) CellDmuxEsHandle
+{
+	shared_mutex _dx_mes; // sys_mutex_t
+	be_t<u32> is_enabled;
+	be_t<u32> error_mem_size;
+	be_t<u32> error_count;
+	vm::bptr<void> error_mem_addr;
+	vm::bptr<CellDmuxEsHandle> _this;
+	be_t<u32> _this_size;
+	be_t<s32> _this_index;
+	vm::bptr<CellDmuxHandle> dmux_handle;
+	CellDmuxEsCb es_cb;
+	vm::bptr<void> core_es_handle;
+	be_t<s32> flush_started;
+
+	struct
+	{
+		be_t<s32> max_size;
+		be_t<s32> allocated_size;
+		be_t<s32> size;
+		be_t<s32> front;
+		be_t<s32> back;
+		be_t<s32> allocated_back;
+	}
+	au_queue;
+};
+
+CHECK_SIZE_ALIGN(CellDmuxEsHandle, 0x50, 0x10);
+
+struct CellDmuxPamfAttr;
+struct CellDmuxPamfEsAttr;
+
+using DmuxNotifyDemuxDone = error_code(vm::ptr<void>, u32, vm::ptr<void>); // TODO broken ?!?!?!?
+using DmuxNotifyFatalErr = error_code(vm::ptr<void>, u32, vm::ptr<void>);
+using DmuxNotifyProgEndCode = error_code(vm::ptr<void>, vm::ptr<void>);
+
+using DmuxEsNotifyAuFound = error_code(vm::ptr<void>, vm::cptr<void> au_info, vm::ptr<void>);
+using DmuxEsNotifyFlushDone = error_code(vm::ptr<void>, vm::ptr<void>);
+
+using CellDmuxCoreOpQueryAttr = error_code(vm::cptr<void>, vm::ptr<CellDmuxPamfAttr>);
+using CellDmuxCoreOpOpen = error_code(vm::cptr<void>, vm::cptr<CellDmuxResource>, vm::cptr<CellDmuxResourceSpurs>, vm::cptr<DmuxCb<DmuxNotifyDemuxDone>>, vm::cptr<DmuxCb<DmuxNotifyProgEndCode>>, vm::cptr<DmuxCb<DmuxNotifyFatalErr>>, vm::pptr<void>);
+using CellDmuxCoreOpClose = error_code(vm::ptr<void>);
+using CellDmuxCoreOpResetStream = error_code(vm::ptr<void>);
+using CellDmuxCoreOpResetCreateThread = error_code(vm::ptr<void>);
+using CellDmuxCoreOpResetJoinThread = error_code(vm::ptr<void>);
+using CellDmuxCoreOpSetStream = error_code(vm::ptr<void>, vm::cptr<void>, u32, b8, u64);
+using CellDmuxCoreOpFreeMemory = error_code(vm::ptr<void>, vm::ptr<void>, u32);
+using CellDmuxCoreOpQueryEsAttr = error_code(vm::cptr<void>, vm::cptr<void>, vm::ptr<CellDmuxPamfEsAttr>);
+using CellDmuxCoreOpEnableEs = error_code(vm::ptr<void>, vm::cptr<void>, vm::cptr<CellDmuxEsResource>, vm::cptr<DmuxCb<DmuxEsNotifyAuFound>>, vm::cptr<DmuxCb<DmuxEsNotifyFlushDone>>, vm::cptr<void>, vm::pptr<void>);
+using CellDmuxCoreOpDisableEs = u32(vm::ptr<void>);
+using CellDmuxCoreOpFlushEs = u32(vm::ptr<void>);
+using CellDmuxCoreOpResetEs = u32(vm::ptr<void>);
+using CellDmuxCoreOpResetStreamAndWaitDone = u32(vm::ptr<void>);
+
+struct CellDmuxCoreOps
+{
+	vm::bptr<CellDmuxCoreOpQueryAttr> queryAttr;
+	vm::bptr<CellDmuxCoreOpOpen> open;
+	vm::bptr<CellDmuxCoreOpClose> close;
+	vm::bptr<CellDmuxCoreOpResetStream> resetStream;
+	vm::bptr<CellDmuxCoreOpResetCreateThread> createThread;
+	vm::bptr<CellDmuxCoreOpResetJoinThread> joinThread;
+	vm::bptr<CellDmuxCoreOpSetStream> setStream;
+	vm::bptr<CellDmuxCoreOpFreeMemory> freeMemory;
+	vm::bptr<CellDmuxCoreOpQueryEsAttr> queryEsAttr;
+	vm::bptr<CellDmuxCoreOpEnableEs> enableEs;
+	vm::bptr<CellDmuxCoreOpDisableEs> disableEs;
+	vm::bptr<CellDmuxCoreOpFlushEs> flushEs;
+	vm::bptr<CellDmuxCoreOpResetEs> resetEs;
+	vm::bptr<CellDmuxCoreOpResetStreamAndWaitDone> resetStreamAndWaitDone;
 };
