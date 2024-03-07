@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Utilities/cond.h"
 #include "cellPamf.h" // CellCodecTimeStamp
 
 // Error Codes
@@ -627,6 +628,20 @@ static_assert(std::is_standard_layout_v<AdecContext>);
 CHECK_SIZE_ALIGN(AdecContext, 0x530, 8);
 
 
+enum : s32
+{
+	CELL_ADEC_LPCM_DVD_CH_RESERVED1,
+	CELL_ADEC_LPCM_DVD_CH_MONO,
+	CELL_ADEC_LPCM_DVD_CH_RESERVED2,
+	CELL_ADEC_LPCM_DVD_CH_STEREO,
+	CELL_ADEC_LPCM_DVD_CH_UNK1, // Either 3 front or 2 front + 1 surround
+	CELL_ADEC_LPCM_DVD_CH_UNK2, // Either 3 front + 1 surround or 2 front + 2 surround
+	CELL_ADEC_LPCM_DVD_CH_3_2,
+	CELL_ADEC_LPCM_DVD_CH_3_2_LFE,
+	CELL_ADEC_LPCM_DVD_CH_3_4,
+	CELL_ADEC_LPCM_DVD_CH_3_4_LFE,
+};
+
 struct CellAdecParamLpcm
 {
 	be_t<u32> channelNumber;
@@ -642,6 +657,133 @@ struct CellAdecLpcmInfo
 	be_t<u32> sampleRate;
 	be_t<u32> outputDataSize;
 };
+
+struct LpcmDecSemaphore
+{
+	atomic_be_t<u32> value;
+	be_t<u32> mutex{}; // sys_mutex_t
+	be_t<u32> cond{};  // sys_cond_t
+
+	LpcmDecSemaphore(be_t<u32> initial_value) : value(initial_value) {}
+
+	void post()
+	{
+		value++;
+		value.notify_one();
+	}
+};
+
+enum class LpcmDecCmdType : u32
+{
+	start_seq,
+	end_seq,
+	decode_au,
+	close
+};
+
+struct LpcmDecCmd
+{
+	be_t<s32> pcm_handle;
+	vm::bcptr<void> au_start_addr;
+	be_t<u32> au_size;
+	u32 reserved1[2];
+	CellAdecParamLpcm lpcm_param;
+	be_t<LpcmDecCmdType> type;
+	u32 reserved2;
+
+	LpcmDecCmd() = default; // cellAdecOpen()
+
+	LpcmDecCmd(LpcmDecCmdType&& type) // Start sequence, end sequence, close
+		: type(type)
+	{
+	}
+
+	LpcmDecCmd(LpcmDecCmdType&& type, const CellAdecParamLpcm& lpcm_param) // Start sequence, end sequence, close
+		: lpcm_param(lpcm_param), type(type)
+	{
+	}
+
+	LpcmDecCmd(LpcmDecCmdType&& type, const s32& pcm_handle, const CellAdecAuInfo& au_info) // Decode au
+		: pcm_handle(pcm_handle), au_start_addr(au_info.startAddr), au_size(au_info.size), type(type)
+	{
+	}
+};
+
+CHECK_SIZE(LpcmDecCmd, 0x2c);
+
+struct LpcmDecContext
+{
+	AdecCmdQueue<LpcmDecCmd> cmd_queue;
+
+	be_t<u64> thread_id; // sys_ppu_thread_t
+
+	shared_mutex queue_size_mutex; // sys_mutex_t
+	be_t<u32> cond1{};             // sys_cond_t
+	be_t<u32> mutex2{};            // sys_mutex_t
+	be_t<u32> cond2{};             // sys_cond_t
+
+	be_t<u32> run_thread = true;
+
+	const AdecCb<AdecNotifyAuDone> notify_au_done;
+	const AdecCb<AdecNotifyPcmOut> notify_pcm_out;
+	const AdecCb<AdecNotifyError> notify_error;
+	const AdecCb<AdecNotifySeqDone> notify_seq_done;
+
+	be_t<u32> output_locked = false;
+	const vm::bptr<f32> output;
+
+	const vm::bptr<CellAdecParamLpcm> lpcm_param;
+
+	const vm::bcptr<void> spurs_cmd_data;
+
+	// HLE exclusive
+	b8 skip_getting_command = false; // For savestates
+	u64 cmd_counter = 0;             // For debugging
+
+	u8 reserved1[24]; // 36 bytes on LLE
+
+	shared_mutex output_mutex;     // sys_mutex_t
+	cond_variable output_consumed; // sys_cond_t
+
+	LpcmDecSemaphore cmd_available{0};
+	const LpcmDecSemaphore reserved2{4}; // Unused
+
+	shared_mutex queue_mutex; // sys_mutex_t
+
+	be_t<u32> error_occurred;
+
+	LpcmDecCmd cmd{}; // HLE exclusive, on LLE pointers to CellSpurs, CellSpursTaskset, etc.
+
+	be_t<u32> using_dvd_packing;
+
+	be_t<u32> output_size;
+
+	u8 more_spurs_stuff[60]{};
+
+	LpcmDecContext(vm::bptr<AdecNotifyAuDone> notifyAuDone, vm::bptr<void> notifyAuDoneArg, vm::bptr<AdecNotifyPcmOut> notifyPcmOut, vm::bptr<void> notifyPcmOutArg, vm::bptr<AdecNotifyError> notifyError,
+		vm::bptr<void> notifyErrorArg, vm::bptr<AdecNotifySeqDone> notifySeqDone, vm::bptr<void> notifySeqDoneArg, vm::bptr<f32> output, vm::bptr<CellAdecParamLpcm> lpcm_param, vm::bcptr<void> spurs_cmd_data)
+		: notify_au_done{ notifyAuDone, notifyAuDoneArg }
+		, notify_pcm_out{ notifyPcmOut, notifyPcmOutArg }
+		, notify_error{ notifyError, notifyErrorArg }
+		, notify_seq_done{ notifySeqDone, notifySeqDoneArg }
+		, output(output)
+		, lpcm_param(lpcm_param)
+		, spurs_cmd_data(spurs_cmd_data)
+	{
+	}
+
+	void exec(ppu_thread& ppu);
+
+	template <LpcmDecCmdType type>
+	inline error_code send_command(ppu_thread& ppu, auto&&... args);
+
+	inline void release_output();
+};
+
+static_assert(std::is_standard_layout_v<LpcmDecContext>);
+CHECK_SIZE(LpcmDecContext, 0x1c8);
+
+constexpr s32 LPCM_DEC_OUTPUT_BUFFER_SIZE = 0x40000;
 
 // CELP Excitation Mode
 enum CELP_ExcitationMode : s32
