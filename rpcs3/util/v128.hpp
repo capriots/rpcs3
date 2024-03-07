@@ -17,12 +17,12 @@ union alignas(16) v128
 		T m_data[N];
 
 	public:
-		T& operator[](usz index)
+		constexpr T& operator[](usz index)
 		{
 			return m_data[index ^ M];
 		}
 
-		const T& operator[](usz index) const
+		constexpr const T& operator[](usz index) const
 		{
 			return m_data[index ^ M];
 		}
@@ -64,6 +64,8 @@ union alignas(16) v128
 	v128() = default;
 
 	constexpr v128(const v128&) noexcept = default;
+
+	constexpr v128(const normal_array_t<s8>& _s8) : _s8(_s8) {};
 
 	template <Vector128 T>
 	constexpr v128(const T& rhs) noexcept

@@ -731,6 +731,57 @@ inline v128 gv_bcstfs(f32 value)
 #endif
 }
 
+// Load 32-bit integer into the first element of a new vector, set other elements to zero
+inline v128 gv_loadu32(const void* ptr)
+{
+#if defined(ARCH_X64)
+	return _mm_loadu_si32(ptr);
+#elif defined(ARCH_ARM64)
+	return vld1q_lane_u32(static_cast<const u32*>(ptr), vdupq_n_u32(0), 0);
+#endif
+}
+
+// Load 8-bit integer into the element specified by Index in an existing vector
+template <u8 Index>
+inline v128 gv_insert8(const v128& vec, u8 value)
+{
+#if defined(__SSE4_1__)
+	return _mm_insert_epi8(vec, value, Index);
+#elif defined(ARCH_ARM64)
+	return vsetq_lane_u8(value, vec, Index & 0xf);
+#else
+	v128 ret = vec;
+	ret._u8[Index & 0xf] = value;
+	return ret;
+#endif
+}
+
+// Load 16-bit integer into the element specified by Index in an existing vector
+template <u8 Index>
+inline v128 gv_insert16(const v128& vec, u16 value)
+{
+#if defined(ARCH_X64)
+	return _mm_insert_epi16(vec, value, Index);
+#elif defined(ARCH_ARM64)
+	return vsetq_lane_u16(value, vec, Index & 0x7);
+#endif
+}
+
+// Load 32-bit integer into the element specified by Index in an existing vector
+template <u8 Index>
+inline v128 gv_insert32(const v128& vec, u32 value)
+{
+#if defined(__SSE4_1__)
+	return _mm_insert_epi32(vec, value, Index);
+#elif defined(ARCH_ARM64)
+	return vsetq_lane_u32(value, vec, Index & 0x3);
+#else
+	v128 ret = vec;
+	ret._u32[Index & 0x3] = value;
+	return ret;
+#endif
+}
+
 inline v128 gv_and32(const v128& a, const v128& b)
 {
 #if defined(ARCH_X64)
@@ -1967,6 +2018,15 @@ inline v128 gv_mulfs(const v128& a, const v128& b)
 #endif
 }
 
+inline v128 gv_mulfs(const v128& a, f32 b)
+{
+#if defined(ARCH_X64)
+	return _mm_mul_ps(a, _mm_set_ps1(b));
+#elif defined(ARCH_ARM64)
+	return vmulq_n_f32(a, b);
+#endif
+}
+
 inline v128 gv_hadds8x2(const v128& a)
 {
 #if defined(__SSSE3__)
@@ -2979,6 +3039,23 @@ inline v128 gv_rol16(const v128& a, const v128& b)
 #endif
 }
 
+// For each 16-bit element, r = rotate a by count
+template <u8 Count>
+inline v128 gv_rol16(const v128& a)
+{
+	constexpr u8 count = Count & 0xf;
+#if defined(ARCH_X64)
+	return _mm_or_si128(_mm_srli_epi16(a, 16 - count), _mm_slli_epi16(a, count));
+#elif defined(ARCH_ARM64)
+	return vorrq_u16(vshrq_n_u16(a, 16 - count), vshlq_n_u16(a, count));
+#else
+	v128 r;
+	for (u32 i = 0; i < 8; i++)
+		r._u16[i] = utils::rol16(a._u16[i], count);
+	return r;
+#endif
+}
+
 // For each 32-bit element, r = rotate a by b
 inline v128 gv_rol32(const v128& a, const v128& b)
 {
@@ -2997,15 +3074,14 @@ inline v128 gv_rol32(const v128& a, const v128& b)
 }
 
 // For each 32-bit element, r = rotate a by count
-inline v128 gv_rol32(const v128& a, u32 count)
+template <u8 Count>
+inline v128 gv_rol32(const v128& a)
 {
-	count %= 32;
+	constexpr u8 count = Count & 0x1f;
 #if defined(ARCH_X64)
-	return _mm_or_epi32(_mm_srli_epi32(a, 32 - count), _mm_slli_epi32(a, count));
+	return _mm_or_si128(_mm_srli_epi32(a, 32 - count), _mm_slli_epi32(a, count));
 #elif defined(ARCH_ARM64)
-	const auto amt1 = vdupq_n_s32(count);
-	const auto amt2 = vdupq_n_s32(count - 32);
-	return vorrq_u32(vshlq_u32(a, amt1), vshlq_u32(a, amt2));
+	return vorrq_u32(vshrq_n_u32(a, 32 - count), vshlq_n_u32(a, count));
 #else
 	v128 r;
 	for (u32 i = 0; i < 4; i++)
@@ -3105,6 +3181,82 @@ template <u32 Count, typename A> requires (asmjit::any_operand_v<A>)
 inline auto gv_shuffle_right(A&& a)
 {
 	FOR_X64(unary_op, kIdPsrldq, kIdVpsrldq, std::forward<A>(a), Count);
+}
+
+template <v128::normal_array_t<s8> Control>
+inline v128 gv_shuffle8(const v128& vec)
+{
+	constexpr v128 ctrl = [&]() constexpr -> v128
+	{
+		v128::normal_array_t<s8> ret{};
+		for (u32 i = 0; i < 16; i++)
+			ret[i] = Control[i] & 0b10001111; // These bits are ignored on x86. This ensures the ARM version behaves the same
+		return ret;
+	}();
+#if defined(__SSSE3__)
+	return _mm_shuffle_epi8(vec, ctrl);
+#elif defined(ARCH_ARM64)
+	return vqtbl1q_s8(vec, ctrl);
+#else
+	v128 ret;
+	for (u32 i = 0; i < 16; i++)
+		ret._s8[i] = ctrl._s8[i] & 0x80 ? 0 : vec._s8[ctrl._s8[i] & 0xf];
+	return ret;
+#endif
+}
+
+template <u8 Control>
+inline v128 gv_shuffle32(const v128& vec)
+{
+#if defined(ARCH_X64)
+	return _mm_shuffle_epi32(vec, Control);
+#elif defined(ARCH_ARM64)
+	constexpr u8 idx0 = (Control & 3) * sizeof(s32);
+	constexpr u8 idx1 = (Control >> 2 & 3) * sizeof(s32);
+	constexpr u8 idx2 = (Control >> 4 & 3) * sizeof(s32);
+	constexpr u8 idx3 = (Control >> 6 & 3) * sizeof(s32);
+
+	constexpr uint8x16_t idx_vec = { idx0, idx0 + 1, idx0 + 2, idx0 + 3, idx1, idx1 + 1, idx1 + 2, idx1 + 3, idx2, idx2 + 1, idx2 + 2, idx2 + 3, idx3, idx3 + 1, idx3 + 2, idx3 + 3 };
+
+	return vqtbl1q_s8(vec, idx_vec);
+#endif
+}
+
+template <u8 Control>
+inline v128 gv_shufflefs(const v128& a, const v128& b)
+{
+#if defined(ARCH_X64)
+	return _mm_shuffle_ps(a, b, Control);
+#elif defined(ARCH_ARM64)
+	constexpr u8 idx0 = (Control & 3) * sizeof(s32);
+	constexpr u8 idx1 = (Control >> 2 & 3) * sizeof(s32);
+	constexpr u8 idx2 = (Control >> 4 & 3) * sizeof(s32) + sizeof(v128);
+	constexpr u8 idx3 = (Control >> 6 & 3) * sizeof(s32) + sizeof(v128);
+
+	constexpr uint8x16_t idx_vec = { idx0, idx0 + 1, idx0 + 2, idx0 + 3, idx1, idx1 + 1, idx1 + 2, idx1 + 3, idx2, idx2 + 1, idx2 + 2, idx2 + 3, idx3, idx3 + 1, idx3 + 2, idx3 + 3 };
+
+	return vqtbl2q_s8({ a, b }, idx_vec);
+#endif
+}
+
+// For each 32-bit element, reverse byte order
+inline v128 gv_rev32(const v128& vec)
+{
+#if defined(__SSSE3__)
+	return _mm_shuffle_epi8(vec, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+#elif defined(ARCH_ARM64)
+	return vrev32q_u8(vec);
+#else
+	return gv_rol32<16>(gv_rol16<8>(vec));
+#endif
+}
+
+// For each 32-bit element, convert between big-endian and native-endian
+inline v128 gv_to_be32(const v128& vec)
+{
+	if constexpr (std::endian::native == std::endian::little)
+		return gv_rev32(vec);
+	return vec;
 }
 
 #if defined(__clang__)
