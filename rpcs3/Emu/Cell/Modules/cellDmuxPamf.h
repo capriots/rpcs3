@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Utilities/cond.h"
 #include <bitset>
 
 
@@ -9,11 +8,11 @@
 template <typename T, u32 max_num_of_entries> requires(std::is_trivial_v<T> && max_num_of_entries > 0)
 class alignas(0x80) DmuxPamfHLESpursQueue
 {
-	T* const buffer;
+	T* buffer;
 
-	atomic_t<u32> _size = 0;
-	u32 front = 0;
-	u32 back = 0;
+	atomic_t<u32> _size;
+	u32 front;
+	u32 back;
 
 	template <bool is_peek, bool is_blocking, atomic_wait_timeout timeout = atomic_wait_timeout::inf>
 	bool _pop(T* lhs)
@@ -82,7 +81,13 @@ class alignas(0x80) DmuxPamfHLESpursQueue
 	}
 
 public:
-	DmuxPamfHLESpursQueue(T (&buffer)[max_num_of_entries]) : buffer(buffer) {}
+	void init(T (&buffer)[max_num_of_entries])
+	{
+		this->buffer = buffer;
+		_size = 0;
+		front = 0;
+		back = 0;
+	}
 
 	bool pop(T& lhs)
 	{
@@ -872,82 +877,84 @@ class DmuxPamfContext
 {
 	static constexpr u32 MAX_ENABLED_ES_NUM = 0x40;
 
-	using AuBitset = std::bitset<MAX_ENABLED_ES_NUM>;
-	static_assert(sizeof(AuBitset) == sizeof(u64), "std::bitset implementation not suitable");
+	using EsBitset = std::bitset<MAX_ENABLED_ES_NUM>; // Each bit represents one elementary stream
+	static_assert(sizeof(EsBitset) == sizeof(u64), "std::bitset implementation not suitable");
 
 	friend struct DmuxPamfElementaryStream;
 
 
 	alignas(0x80) u8 spurs[0x1000]; // CellSpurs
-	const vm::bptr<void> spurs_addr;       // CellSpurs*
-	const b8 use_existing_spurs;
+	vm::bptr<void> spurs_addr;      // CellSpurs*
+	b8 use_existing_spurs;
 
-	alignas(0x80) const u8 spurs_taskset[0x1900]{}; // CellSpursTaskset
-	const be_t<u32> spurs_task_id{};                       // CellSpursTaskId
-	const vm::bptr<void> spurs_context_addr;
+	alignas(0x80) u8 spurs_taskset[0x1900]; // CellSpursTaskset
+	be_t<u32> spurs_task_id;                // CellSpursTaskId
+	vm::bptr<void> spurs_context_addr;
 
-	u8 reserved_1[16]; // Unused
+	u8 reserved1[0x10]; // Unused
 
-	const vm::bptr<DmuxPamfContext> _this;
-	const be_t<u32> this_size;
-	const be_t<u32> version = DMUX_PAMF_VERSION;
+	vm::bptr<DmuxPamfContext> _this;
+	be_t<u32> this_size;
+	be_t<u32> version;
 
-	const DmuxCb<DmuxNotifyDemuxDone> notify_demux_done;
-	const DmuxCb<DmuxNotifyProgEndCode> notify_prog_end_code;
-	const DmuxCb<DmuxNotifyFatalErr> notify_fatal_err;
+	DmuxCb<DmuxNotifyDemuxDone> notify_demux_done;
+	DmuxCb<DmuxNotifyProgEndCode> notify_prog_end_code;
+	DmuxCb<DmuxNotifyFatalErr> notify_fatal_err;
 
-	const CellDmuxPamfResource resource;
+	CellDmuxPamfResource resource;
 
 	be_t<u64> thread_id; // sys_ppu_thread_t
 
-	const be_t<u32> unk = 0; // Unused
+	be_t<u32> unk; // Unused
 
-	const be_t<u32> ppu_thread_stack_size;
+	be_t<u32> ppu_thread_stack_size;
 
-	be_t<AuBitset> au_released{}; // Each bit corresponds to one elementary stream index. 1 means cellDmuxReleaseAu() was called
+	be_t<EsBitset> au_released; // If a bit is set then cellDmuxReleaseAu() was called for that elementary stream
 
-	b8 stream_reset_requested = false;
+	b8 stream_reset_requested;
 
-	be_t<u32> dmux_status = 0; // TODOOOOOOOOOO make enum
+	be_t<u32> dmux_status; // TODO make enum
 
-	const be_t<u32> max_enabled_es_num = MAX_ENABLED_ES_NUM;
-	be_t<s32> enabled_es_num = 0;
-	vm::bptr<DmuxPamfElementaryStream> elementary_streams[MAX_ENABLED_ES_NUM]{};
+	be_t<u32> max_enabled_es_num;
+	be_t<s32> enabled_es_num;
+	vm::bptr<DmuxPamfElementaryStream> elementary_streams[MAX_ENABLED_ES_NUM];
 
-	shared_mutex mutex; // sys_mutex_t
-	cond_variable cond; // sys_cond_t
+	be_t<u32> mutex; // sys_mutex_t
+	be_t<u32> cond;  // sys_cond_t
 
-	const vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfCommand, 1>> cmd_queue_addr_; // Same as cmd_queue_addr, unused
-	const vm::bptr<DmuxPamfCommand[1]> cmd_queue_buffer_addr_;                 // Same as cmd_queue_buffer_addr, unused
+	vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfCommand, 1>> cmd_queue_addr_; // Same as cmd_queue_addr, unused
+	vm::bptr<DmuxPamfCommand[1]> cmd_queue_buffer_addr_;                 // Same as cmd_queue_buffer_addr, unused
 
-	const vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfCommand, 1>> cmd_queue_addr;            // CellSpursQueue*
-	const vm::bptr<DmuxPamfHLESpursQueue<be_t<u32>, 1>> cmd_result_queue_addr;           // CellSpursQueue*
-	const vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfStreamInfo, 1>> stream_info_queue_addr; // CellSpursQueue*
-	const vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfEvent, 132>> event_queue_addr;          // CellSpursQueue*
+	vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfCommand, 1>> cmd_queue_addr;            // CellSpursQueue*
+	vm::bptr<DmuxPamfHLESpursQueue<be_t<u32>, 1>> cmd_result_queue_addr;           // CellSpursQueue*
+	vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfStreamInfo, 1>> stream_info_queue_addr; // CellSpursQueue*
+	vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfEvent, 132>> event_queue_addr;          // CellSpursQueue*
 
-	const vm::bptr<DmuxPamfCommand[1]> cmd_queue_buffer_addr;
-	const vm::bptr<be_t<u32>[1]> cmd_result_queue_buffer_addr;
-	const vm::bptr<DmuxPamfEvent[132]> event_queue_buffer_addr;
-	const vm::bptr<DmuxPamfStreamInfo[1]> stream_info_queue_buffer_addr;
+	vm::bptr<DmuxPamfCommand[1]> cmd_queue_buffer_addr;
+	vm::bptr<be_t<u32>[1]> cmd_result_queue_buffer_addr;
+	vm::bptr<DmuxPamfEvent[132]> event_queue_buffer_addr;
+	vm::bptr<DmuxPamfStreamInfo[1]> stream_info_queue_buffer_addr;
 
-	const vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfCommand, 1>> cmd_queue_addr__; // Same as cmd_queue_addr, unused
+	vm::bptr<DmuxPamfHLESpursQueue<DmuxPamfCommand, 1>> cmd_queue_addr__; // Same as cmd_queue_addr, unused
 
 	be_t<u64> user_data;
 
 	b8 is_raw_es;
 
-	be_t<u32> next_es_id = 0;
+	be_t<u32> next_es_id;
 
-	const std::array<char, 24> spurs_taskset_name;
+	char spurs_taskset_name[24];
 
 	// HLE exclusive
 	DmuxPamfSPUThread* hle_spu_thread;
-	AuBitset au_queue_full{};
-	b8 stream_reset_requested_save = false;
-	b8 stream_reset_in_progress = false;
-	b8 skip_waiting_for_au_released_or_stream_reset = false;
+	// These are stack variables in the PPU thread function, we put theme here for savestates
+	EsBitset au_queue_full;
+	b8 stream_reset_requested_save;
+	b8 stream_reset_in_progress;
 
-	u8 reserved_2[909]; // Unused, 928 bytes on LLE
+	b8 _skip_waiting_for_au_released_or_stream_reset; // TODO remove
+
+	u8 reserved2[909]; // Unused, 928 bytes on LLE
 
 	DmuxPamfHLESpursQueue<DmuxPamfCommand, 1> cmd_queue;            // CellSpursQueue
 	DmuxPamfHLESpursQueue<be_t<u32>, 1> cmd_result_queue;           // CellSpursQueue
@@ -963,64 +970,33 @@ class DmuxPamfContext
 	static_assert(sizeof(spurs_context) >= sizeof(DmuxPamfSPUThread)); // We can put the thread here
 
 public:
-	DmuxPamfContext(vm::bptr<void> spurs_addr, b8 use_existing_spurs, vm::ptr<DmuxPamfContext> _this, vm::bptr<DmuxNotifyDemuxDone> notify_demux_done, vm::bptr<void> notify_dmux_done_arg, vm::bptr<DmuxNotifyProgEndCode> notify_prog_end_code,
-		vm::bptr<void> notify_prog_end_code_arg, vm::bptr<DmuxNotifyFatalErr> notify_fatal_err, vm::bptr<void> notify_fatal_err_arg, const CellDmuxPamfResource& res)
-		: spurs_addr(spurs_addr)
-		, use_existing_spurs(use_existing_spurs)
-		, spurs_context_addr(_this.ptr(&DmuxPamfContext::spurs_context))
-		, _this(_this)
-		, this_size(res.memSize)
-		, notify_demux_done{ notify_demux_done, notify_dmux_done_arg }
-		, notify_prog_end_code{ notify_prog_end_code, notify_prog_end_code_arg }
-		, notify_fatal_err{ notify_fatal_err, notify_fatal_err_arg }
-		, resource(res)
-		, ppu_thread_stack_size(res.ppuThreadStackSize)
-		, cmd_queue_addr_(_this.ptr(&DmuxPamfContext::cmd_queue))
-		, cmd_queue_buffer_addr_(_this.ptr(&DmuxPamfContext::cmd_queue_buffer))
-		, cmd_queue_addr(_this.ptr(&DmuxPamfContext::cmd_queue))
-		, cmd_result_queue_addr(_this.ptr(&DmuxPamfContext::cmd_result_queue))
-		, stream_info_queue_addr(_this.ptr(&DmuxPamfContext::stream_info_queue))
-		, event_queue_addr(_this.ptr(&DmuxPamfContext::event_queue))
-		, cmd_queue_buffer_addr(_this.ptr(&DmuxPamfContext::cmd_queue_buffer))
-		, cmd_result_queue_buffer_addr(_this.ptr(&DmuxPamfContext::cmd_result_queue_buffer))
-		, event_queue_buffer_addr(_this.ptr(&DmuxPamfContext::event_queue_buffer))
-		, stream_info_queue_buffer_addr(_this.ptr(&DmuxPamfContext::stream_info_queue_buffer))
-		, cmd_queue_addr__(_this.ptr(&DmuxPamfContext::cmd_queue))
-		, spurs_taskset_name([&]
-			{
-				std::array<char, 24> ret;
-				std::snprintf(ret.data(), sizeof(ret), "_libdmux_pamf_%08x", _this.addr());
-				ret[23] = '\0';
-				return ret;
-			}())
-		, cmd_queue(cmd_queue_buffer)
-		, cmd_result_queue(cmd_result_queue_buffer)
-		, stream_info_queue(stream_info_queue_buffer)
-		, event_queue(event_queue_buffer)
-	{
-		ensure(this == _this.get_ptr());
-	}
-
-	void construct_spu_thread() { hle_spu_thread = new (&spurs_context) DmuxPamfSPUThread(&cmd_queue, &cmd_result_queue, &stream_info_queue, &event_queue); }
-	void destruct_spu_thread() { hle_spu_thread->~named_thread(); }
+	void run_spu_thread() { hle_spu_thread = new (&spurs_context) DmuxPamfSPUThread(&cmd_queue, &cmd_result_queue, &stream_info_queue, &event_queue); }
+	void stop_spu_thread() const { hle_spu_thread->~named_thread(); }
 
 	DmuxPamfElementaryStream* find_es(u16 stream_id, u16 private_stream_id);
 
+	static u32 open(ppu_thread& ppu, const CellDmuxPamfResource& res, const DmuxCb<DmuxNotifyDemuxDone>& notify_dmux_done, const DmuxCb<DmuxNotifyProgEndCode>& notify_prog_end_code, const DmuxCb<DmuxNotifyFatalErr>& notify_fatal_err, vm::bptr<DmuxPamfContext>& handle);
 	u32 create_thread(ppu_thread& ppu);
 	u32 close(ppu_thread& ppu);
-	u32 reset_stream();
+	u32 reset_stream(ppu_thread& ppu);
 	u32 join_thread(ppu_thread& ppu);
-	u32 set_stream(vm::cptr<void> stream_address, u32 stream_size, b8 discontinuity, u32 user_data, bool is_raw_es);
-	u32 enable_es(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, vm::ptr<void> mem_addr, u32 mem_size, vm::bptr<DmuxEsNotifyAuFound> notify_au_found, vm::bptr<void> notify_au_found_arg,
-		vm::bptr<DmuxEsNotifyFlushDone> notify_flush_done, vm::bptr<void> notify_flush_done_arg, bool is_raw_es, vm::bptr<DmuxPamfElementaryStream>& es);
-	u32 reset_stream_and_wait_done();
+
+	template <bool raw_es>
+	u32 set_stream(ppu_thread& ppu, vm::cptr<void> stream_address, u32 stream_size, b8 discontinuity, u32 user_data);
+
+	template <bool raw_es>
+	u32 enable_es(ppu_thread& ppu, u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, vm::ptr<void> mem_addr, u32 mem_size, vm::bptr<DmuxEsNotifyAuFound> notify_au_found,
+		vm::bptr<void> notify_au_found_arg, vm::bptr<DmuxEsNotifyFlushDone> notify_flush_done, vm::bptr<void> notify_flush_done_arg, vm::bptr<DmuxPamfElementaryStream>& es);
+
+	u32 reset_stream_and_wait_done(ppu_thread& ppu);
 
 	void exec(ppu_thread& ppu);
 
-	void wait_au_released_or_stream_reset(ppu_thread& ppu, AuBitset au_queue_full);
+private:
+	u32 wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset au_queue_full);
 
-	template <bool state>
-	void set_au_skip();
+	template <bool skip>
+	u32 set_au_skip(ppu_thread& ppu);
 };
 
 static_assert(std::is_standard_layout_v<DmuxPamfContext>);
@@ -1046,7 +1022,7 @@ struct DmuxPamfElementaryStream
 	vm::bptr<DmuxPamfContext> demuxer;
 
 	DmuxCb<DmuxEsNotifyAuFound> notify_au_found;
-	const DmuxCb<DmuxEsNotifyFlushDone> notify_flush_done;
+	DmuxCb<DmuxEsNotifyFlushDone> notify_flush_done;
 
 	be_t<u16> stream_id;
 	be_t<u16> private_stream_id;
@@ -1055,51 +1031,22 @@ struct DmuxPamfElementaryStream
 	vm::bptr<u8> au_queue_buffer;
 	be_t<u32> unk; // Likely au_queue_buffer_size, unused
 	be_t<u32> au_max_size;
-	std::array<u8, 0x10> au_specific_info;
-	const be_t<u32> au_specific_info_size;
+	u8 au_specific_info[0x10];
+	be_t<u32> au_specific_info_size;
 
-	b8 skip_next_au = false;
+	b8 skip_next_au;
 
-	const be_t<u32> es_id;
+	be_t<u32> es_id;
 
 	u8 reserved[72];
 
-	DmuxPamfElementaryStream(vm::bptr<DmuxPamfElementaryStream> _this, be_t<u32> this_size, u8 this_index, vm::bptr<DmuxPamfContext> demuxer, vm::bptr<DmuxEsNotifyAuFound> notify_au_found, vm::bptr<void> notify_au_found_arg,
-		vm::bptr<DmuxEsNotifyFlushDone> notify_flush_done, vm::bptr<void> notify_flush_done_arg, be_t<u16> stream_id, be_t<u16> private_stream_id, b8 is_avc, vm::bptr<u8> au_queue_buffer, be_t<u32> au_max_size, be_t<u32> au_specific_info_size, be_t<u32> es_id)
-		: _this(_this)
-		, this_size(this_size)
-		, this_index(this_index)
-		, demuxer(demuxer)
-		, notify_au_found{ notify_au_found, notify_au_found_arg }
-		, notify_flush_done{ notify_flush_done, notify_flush_done_arg }
-		, stream_id(stream_id)
-		, private_stream_id(private_stream_id)
-		, is_avc(is_avc)
-		, au_queue_buffer(au_queue_buffer)
-		, au_max_size(au_max_size)
-		, au_specific_info_size(au_specific_info_size)
-		, es_id(es_id)
-	{
-	}
-
-	~DmuxPamfElementaryStream()
-	{
-		_this = vm::null;
-		this_size = 0;
-		this_index = 0;
-		demuxer = vm::null;
-		notify_au_found = {};
-		au_queue_buffer = vm::null;
-		unk = 0;
-	}
-
-	u32 free_memory(vm::ptr<void> mem_addr, u32 mem_size);
-	u32 disable_es();
-	u32 flush_es();
-	u32 reset_es();
+	u32 free_memory(ppu_thread& ppu, vm::ptr<void> mem_addr, u32 mem_size) const;
+	u32 disable_es(ppu_thread& ppu);
+	u32 flush_es(ppu_thread& ppu) const;
+	u32 reset_es(ppu_thread& ppu) const;
 };
 
-static_assert(std::is_standard_layout_v<DmuxPamfElementaryStream>);
+static_assert(std::is_standard_layout_v<DmuxPamfElementaryStream> && std::is_trivial_v<DmuxPamfElementaryStream>);
 CHECK_SIZE_ALIGN(DmuxPamfElementaryStream, 0x98, 4);
 
 struct CellDmuxPamfEsHandle
