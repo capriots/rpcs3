@@ -1,5 +1,7 @@
 #include "stdafx.h"
 #include "Emu/Cell/PPUModule.h"
+#include "Emu/Cell/lv2/sys_mutex.h"
+#include "Emu/Cell/lv2/sys_cond.h"
 #include "Emu/Cell/lv2/sys_sync.h"
 #include "Emu/Cell/lv2/sys_ppu_thread.h"
 #include "Emu/savestate_utils.hpp"
@@ -10,7 +12,6 @@
 #include "cellPamf.h"
 #include "cellDmux.h"
 #include "cellDmuxPamf.h"
-
 
 vm::gvar<CellDmuxCoreOps> g_cell_dmux_core_ops_pamf;
 vm::gvar<CellDmuxCoreOps> g_cell_dmux_core_ops_raw_es;
@@ -35,7 +36,25 @@ void fmt_class_string<CellDmuxPamfError>::format(std::string& out, u64 arg)
 	});
 }
 
-std::pair<DmuxPamfStreamTypeIndex, u32> dmuxPamfStreamIdToTypeChannel(u16 stream_id, u16 private_stream_id)
+template <>
+void fmt_class_string<DmuxPamfInternalError>::format(std::string& out, u64 arg)
+{
+	format_enum(out, arg, [](DmuxPamfInternalError value)
+	{
+		switch (value)
+		{
+			STR_CASE(DMUX_PAMF_INTERNAL_ERROR_ARG);
+			STR_CASE(DMUX_PAMF_INTERNAL_ERROR_NO_MEMORY);
+			STR_CASE(DMUX_PAMF_INTERNAL_ERROR_UNKNOWN_STREAM);
+			STR_CASE(DMUX_PAMF_INTERNAL_ERROR_BUSY);
+			STR_CASE(DMUX_PAMF_INTERNAL_ERROR_FATAL);
+		}
+
+		return unknown;
+	});
+}
+
+inline std::pair<DmuxPamfStreamTypeIndex, u32> dmuxPamfStreamIdToTypeChannel(u16 stream_id, u16 private_stream_id)
 {
 	if ((stream_id & 0xf0) == 0xe0)
 	{
@@ -1505,6 +1524,7 @@ bool DmuxPamfSPUContext::get_next_cmd(DmuxPamfCommand& lhs, bool new_stream)
 
 	cellDmuxPamf.trace("No new command or work to do, waiting...");
 
+	// TODO aborting???
 	while (thread_ctrl::state() != thread_state::aborting && !cmd_queue->try_pop_for<static_cast<atomic_wait_timeout>(20'000'000)>(lhs));
 
 	if (thread_ctrl::state() == thread_state::aborting)
@@ -1646,23 +1666,36 @@ void DmuxPamfSPUContext::operator()() // cellSpursMain()
 // PPU
 //----------------------------------------------------------------------------
 
-void DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, AuBitset au_queue_full)
+u32 DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset au_queue_full)
 {
-	std::lock_guard lock{mutex};
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+	{
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
 
 	if (au_queue_full.any())
 	{
 		cellDmuxPamf.trace("Waiting for AU to be released...");
 
-		while (!ppu.is_stopped() && (au_queue_full & au_released.get()).none() && !this->stream_reset_requested)
+		while ((au_queue_full & au_released.get()).none() && !this->stream_reset_requested)
 		{
-			lv2_obj::sleep(ppu);
-			cond.wait(mutex, 20'000);
-		}
+			if (error_code ret = sys_cond_wait(ppu, cond, 0); ret != CELL_OK)
+            {
+                sys_mutex_unlock(ppu, mutex);
+                return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+            }
 
-		if (ppu.is_stopped())
-		{
-			return;
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return {};
+			}
 		}
 
 		cellDmuxPamf.trace("AU released");
@@ -1672,22 +1705,30 @@ void DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, AuBitset
 	this->stream_reset_requested = false;
 
 	au_released = au_released.get().reset();
+
+	return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
-template <bool state>
-void DmuxPamfContext::set_au_skip()
+template <bool skip>
+u32 DmuxPamfContext::set_au_skip(ppu_thread& ppu)
 {
-	std::lock_guard lock{mutex};
-
-	for (vm::bptr<DmuxPamfElementaryStream> es : elementary_streams)
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
 	{
-		if (es)
-		{
-			es->skip_next_au = state;
-		}
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
+
+	std::ranges::for_each(elementary_streams, [](auto& es) { if (es) es->skip_next_au = skip; });
+
+	return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
-// TODO ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::: BLOCK SAVESTATES DURING CALLBACKS
+
+// TODO block savestates creation during callbacks
 void DmuxPamfContext::exec(ppu_thread& ppu)
 {
 	if (ppu.loaded_from_savestate)
@@ -1697,46 +1738,69 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 	DmuxPamfEvent event{};
 
-	for (;; skip_waiting_for_au_released_or_stream_reset = false /* Savestates */)
+	for (;;)
 	{
-		if (!skip_waiting_for_au_released_or_stream_reset)
-		{
-			wait_au_released_or_stream_reset(ppu, au_queue_full);
-		}
+		if (wait_au_released_or_stream_reset(ppu, au_queue_full) != CELL_OK)
+        {
+			// TODO block savestaates
+            notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+        }
 
+		// TODO savestates
 		if (ppu.state & cpu_flag::again)
 		{
 			return;
 		}
 
-		skip_waiting_for_au_released_or_stream_reset = true; // Savestates
-
-		cellDmuxPamf.trace("Waiting for next event...");
-
-		do lv2_obj::sleep(ppu);
+		cellDmuxPamf.trace("Waiting for the next event...");
+		lv2_obj::sleep(ppu);
+		do {}
 		while (!ppu.is_stopped() && !event_queue.try_peek_for<static_cast<atomic_wait_timeout>(20'000'000)>(event));
 
-
+		// TODO savestates
 		if (ppu.is_stopped())
 		{
 			ppu.state += cpu_flag::again;
 			return;
 		}
 
+		// TODO does this properly cancel lv2_obj::sleep(ppu), so that the following sys_mutex_lock() calls work properly?
+		lv2_obj::awake(&ppu);
+		ensure(!ppu.check_state());
+
 		cellDmuxPamf.trace("Received event %d", static_cast<u32>(event.type.get()));
 
 		if (event.type == DmuxPamfEventType::demux_done)
 		{
-			{
-				std::lock_guard lock{mutex};
+			if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+            {
+				// TODO block savestates
+                notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+            }
 
-				dmux_status = 1;
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return;
 			}
+
+			dmux_status = 1;
+
+			if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+            {
+                // TODO block savestates
+                notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+            }
 
 			if (!stream_reset_requested_save)
 			{
-				wait_au_released_or_stream_reset(ppu, au_queue_full);
+				if (wait_au_released_or_stream_reset(ppu, au_queue_full) != CELL_OK)
+				{
+					// TODO block savestaates
+					notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				}
 
+				// TODO savestates
 				if (ppu.state & cpu_flag::again)
 				{
 					return;
@@ -1747,27 +1811,60 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		if (stream_reset_requested_save)
 		{
 			stream_reset_in_progress = true;
-			set_au_skip<true>();
+
+			if (set_au_skip<true>(ppu) != CELL_OK)
+            {
+                // TODO block savestates
+                notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+            }
+
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return;
+			}
 		}
+
+		// TODO savestates: executing cmd
 
 		switch (event.type)
 		{
 		case DmuxPamfEventType::au_found:
 		{
-			DmuxPamfElementaryStream* es;
-			const vm::var<DmuxPamfAuInfo> au_info;
+			if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+			{
+				cellDmuxPamf.error("1");
 
-			std::unique_lock lock{mutex};
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
+			}
 
-			es = find_es(event.au_found.stream_id, event.au_found.private_stream_id);
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return;
+			}
+
+			DmuxPamfElementaryStream* const es = find_es(event.au_found.stream_id, event.au_found.private_stream_id);
 
 			if (!es || es->_this.get_ptr() != es || es->es_id != event.au_found.es_id)
 			{
+				if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+				{
+					cellDmuxPamf.error("2");
+
+					// TODO block savestates
+					notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+					continue;
+				}
+
 				break;
 			}
 
 			if (!stream_reset_in_progress)
 			{
+				const vm::var<DmuxPamfAuInfo> au_info;
 				au_info->addr = std::bit_cast<vm::bptr<void, u64>>(event.au_found.au_addr);
 				au_info->size = event.au_found.au_size;
 				au_info->pts = event.au_found.pts;
@@ -1787,7 +1884,14 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 					}
 				}
 
-				lock.unlock();
+				if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+				{
+					cellDmuxPamf.error("3");
+
+					// TODO block savestates
+					notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+					continue;
+				}
 
 				// Block savestate creation during callbacks
 				std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
@@ -1803,29 +1907,28 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 					au_queue_full.set(es->this_index);
 					continue;
 				}
+
+				break;
 			}
-			else if (es->skip_next_au)
+
+			if (es->skip_next_au)
 			{
-				// Block savestate creation during callbacks
-				std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-				if (!savestate_lock.owns_lock())
-				{
-					ppu.state += cpu_flag::again;
-					return;
-				}
-
 				es->skip_next_au = false;
 
-				if (be_t<u32> result;
-					!cmd_queue.try_emplace(DmuxPamfCmdType::reset_es, event.au_found.stream_id, event.au_found.private_stream_id, event.au_found.au_addr)
-					|| !cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::reset_es) + 1)
-				{
-					lock.unlock();
-					event_queue.pop();
-					notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg);
-					continue;
-				}
+				// TODO put into function
+				be_t<u32> result;
+				ensure(cmd_queue.try_emplace(DmuxPamfCmdType::reset_es, event.au_found.stream_id, event.au_found.private_stream_id, event.au_found.au_addr));
+				ensure(cmd_result_queue.pop(result));
+				ensure(result == static_cast<u32>(DmuxPamfCmdType::reset_es) + 1);
+			}
+
+			if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+			{
+				cellDmuxPamf.error("4");
+
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
 			}
 
 			break;
@@ -1835,35 +1938,98 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 			if (stream_reset_in_progress)
 			{
 				stream_reset_in_progress = false;
-				set_au_skip<false>();
+
+				if (set_au_skip<false>(ppu) != CELL_OK)
+                {
+                    // TODO block savestates
+                    notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+					continue;
+                }
+
+				// TODO savestates
+				if (ppu.state & cpu_flag::again)
+				{
+					return;
+				}
 			}
 
+			// TODO block savestates
 			notify_demux_done.cbFunc(ppu, _this, CELL_OK, notify_demux_done.cbArg);
 
-			std::lock_guard lock{mutex};
-
-			if (dmux_status == 1)
+			if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
 			{
-				dmux_status = 0;
-				cond.notify_all();
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
+			}
+
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return;
+			}
+
+			if (dmux_status == 1) // TODO make enum
+			{
+				dmux_status = 0; // TODO make enum
+
+				if (error_code ret = sys_cond_signal_all(ppu, cond); ret != CELL_OK)
+                {
+					sys_mutex_unlock(ppu, mutex);
+
+                    // TODO block savestates
+                    notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+                    continue;
+                }
+
+				// TODO savestates
+				if (ppu.state & cpu_flag::again)
+				{
+					return;
+				}
+			}
+
+			if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+			{
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
 			}
 
 			break;
 		}
 		case DmuxPamfEventType::close:
 		{
-			while (event_queue.try_pop());
+			while (event_queue.try_pop()){}
 			return;
 		}
 		case DmuxPamfEventType::flush_done:
 		{
-			std::unique_lock lock{mutex};
+			if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+			{
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
+			}
+
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return;
+			}
 
 			const auto es = find_es(event.flush_done.stream_id, event.flush_done.private_stream_id);
+			const bool valid = es && es->_this.get_ptr() == es && es->es_id == event.flush_done.es_id;
 
-			if (es && es->_this.get_ptr() == es && es->es_id == event.flush_done.es_id)
+			if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
 			{
-				lock.unlock();
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
+			}
+
+			if (valid)
+			{
 				es->notify_flush_done.cbFunc(ppu, es->_this, es->notify_flush_done.cbArg);
 			}
 
@@ -1871,12 +2037,15 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		}
 		case DmuxPamfEventType::prog_end_code:
 		{
+			// TODO block savestates
 			notify_prog_end_code.cbFunc(ppu, _this, notify_prog_end_code.cbArg);
 			break;
 		}
 		case DmuxPamfEventType::fatal_error:
 		{
-			event_queue.pop();
+			ensure(event_queue.try_pop());
+
+			// TODO block savestates
 			notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
 			continue;
 		}
@@ -1884,22 +2053,34 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 			fmt::throw_exception("Invalid event");
 		}
 
-		event_queue.try_pop();
+		ensure(event_queue.try_pop());
 
 		if (enabled_es_num >= 0 && event_queue.size() == 2)
 		{
-			std::unique_lock lock{mutex};
+			if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+			{
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
+			}
+
+			// TODO savestates
+			if (ppu.state & cpu_flag::again)
+			{
+				return;
+			}
 
 			if (enabled_es_num >= 0)
 			{
-				if (!cmd_queue.try_emplace(DmuxPamfCmdType::resume))
-				{
-					lock.unlock();
-					notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg);
-					continue;
-				}
+				ensure(cmd_queue.try_emplace(DmuxPamfCmdType::resume));
+				cmd_result_queue.pop(); // TODO savestates ???
+			}
 
-				cmd_result_queue.pop();
+			if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+			{
+				// TODO block savestates
+				notify_fatal_err.cbFunc(ppu, _this, CELL_OK, notify_fatal_err.cbArg); // LLE uses CELL_OK
+				continue;
 			}
 		}
 
@@ -1913,7 +2094,7 @@ void dmuxPamfEntry(ppu_thread& ppu, vm::ptr<DmuxPamfContext> dmux)
 
 	if (ppu.state & cpu_flag::again)
 	{
-		dmux->destruct_spu_thread();
+		dmux->stop_spu_thread();
 		ppu.syscall_args[0] = dmux.addr(); // For savestates, save argument
 		return;
 	}
@@ -1969,9 +2150,10 @@ u32 dmuxPamfVerifyEsSpecificInfo(u16 stream_id, u16 private_stream_id, bool is_a
 	}
 }
 
-u32 dmuxPamfGetAuSpecificInfoSize(u16 stream_id, u16 private_stream_id, bool is_avc, bool is_raw_es)
+template <bool raw_es>
+u32 dmuxPamfGetAuSpecificInfoSize(u16 stream_id, u16 private_stream_id, bool is_avc)
 {
-	if (is_raw_es)
+	if constexpr (raw_es)
 	{
 		return 0;
 	}
@@ -2001,12 +2183,17 @@ u32 dmuxPamfGetAuQueueMaxSize(u16 stream_id, u16 private_stream_id)
 {
 	switch (dmuxPamfStreamIdToTypeChannel(stream_id, private_stream_id).first)
 	{
-	case DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO:     return 0x40;
-	case DMUX_PAMF_STREAM_TYPE_INDEX_LPCM:      return 0x100;
-	case DMUX_PAMF_STREAM_TYPE_INDEX_AC3:       return 0x40;
-	case DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX:    return 0x40;
-	case DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA: return 0x40;
-	default:                                    return 0;
+	case DMUX_PAMF_STREAM_TYPE_INDEX_LPCM:
+		return 0x100;
+
+	case DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO:
+	case DMUX_PAMF_STREAM_TYPE_INDEX_AC3:
+	case DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX:
+	case DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA:
+		return 0x40;
+
+	default:
+		return 0;
 	}
 }
 
@@ -2101,9 +2288,10 @@ u32 dmuxPamfGetAuQueueBufferSize(u16 stream_id, u16 private_stream_id, bool is_a
 	}
 }
 
-u32 dmuxPamfGetEsMemSize(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, bool is_raw_es)
+template <bool raw_es>
+u32 dmuxPamfGetEsMemSize(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info)
 {
-	return dmuxPamfGetAuSpecificInfoSize(stream_id, private_stream_id, is_avc, is_raw_es) * dmuxPamfGetAuQueueMaxSize(stream_id, private_stream_id)
+	return dmuxPamfGetAuSpecificInfoSize<raw_es>(stream_id, private_stream_id, is_avc) * dmuxPamfGetAuQueueMaxSize(stream_id, private_stream_id)
 		+ dmuxPamfGetAuQueueBufferSize(stream_id, private_stream_id, is_avc, es_specific_info) + 0x7f + static_cast<u32>(sizeof(DmuxPamfElementaryStream)) + 0xf;
 }
 
@@ -2157,99 +2345,114 @@ u32 DmuxPamfContext::close(ppu_thread& ppu)
 		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	hle_spu_thread->~named_thread();
+	stop_spu_thread();
 
 	return CELL_OK;
 }
 
-u32 DmuxPamfContext::reset_stream()
+u32 DmuxPamfContext::reset_stream(ppu_thread& ppu)
 {
-	std::lock_guard lock{mutex};
-
-	if (dmux_status != 2)
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
 	{
-		return CELL_OK;
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	if (!cmd_queue.try_emplace(DmuxPamfCmdType::reset_stream))
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
 	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
+		return {};
 	}
 
-	if (be_t<u32> result; !cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::reset_stream) + 1)
+	if (dmux_status != 2) // TODO make enum
 	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
+		return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
+
+	be_t<u32> result;
+	ensure(cmd_queue.try_emplace(DmuxPamfCmdType::reset_stream), "The command queue wasn't empty");
+	ensure(cmd_result_queue.pop(result)); // Blocks until the SPU thread has consumed the command // TODO should prolly check for savestates here
+	ensure(result == static_cast<u32>(DmuxPamfCmdType::reset_stream) + 1, "The HLE SPU thread returned an invalid result");
 
 	stream_reset_requested = true;
-	cond.notify_one();
 
-	return CELL_OK;
+	if (error_code ret = sys_cond_signal_to(ppu, cond, static_cast<u32>(thread_id)); ret != CELL_OK && ret != static_cast<s32>(CELL_EPERM))
+	{
+		sys_mutex_unlock(ppu, mutex);
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
+
+	return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
 u32 DmuxPamfContext::join_thread(ppu_thread& ppu)
 {
-	{
-		std::lock_guard lock{mutex};
-
-		for (s32 i = 0; i < enabled_es_num; i++)
-		{
-			elementary_streams[i] = vm::null;
-		}
-
-		enabled_es_num = -1;
-
-		if (!cmd_queue.try_emplace(DmuxPamfCmdType::close))
-		{
-			return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-		}
-
-		if (be_t<u32> result; !cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::close) + 1)
-		{
-			return DMUX_PAMF_INTERNAL_ERROR_FATAL;
-		}
-	}
-
-	if (vm::var<u64> ret; sys_ppu_thread_join(ppu, static_cast<u32>(thread_id), +ret) != CELL_OK)
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
 	{
 		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	return CELL_OK;
+	std::ranges::fill_n(elementary_streams, enabled_es_num, vm::null);
+
+	enabled_es_num = -1;
+
+	// TODO put in function
+	be_t<u32> result;
+	ensure(cmd_queue.try_emplace(DmuxPamfCmdType::close));
+	ensure(cmd_result_queue.pop(result));
+	ensure(result == static_cast<u32>(DmuxPamfCmdType::close) + 1);
+
+	if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+	{
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
+
+	vm::var<u64> ret;
+	return sys_ppu_thread_join(ppu, static_cast<u32>(thread_id), +ret) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
-u32 DmuxPamfContext::set_stream(vm::cptr<void> stream_address, u32 stream_size, b8 discontinuity, u32 user_data, bool is_raw_es)
+template <bool raw_es>
+u32 DmuxPamfContext::set_stream(ppu_thread& ppu, vm::cptr<void> stream_address, u32 stream_size, b8 discontinuity, u32 user_data)
 {
-	std::lock_guard lock{mutex};
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+	{
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
 
 	this->user_data = user_data;
 
-	if (!stream_info_queue.try_emplace(stream_address, stream_size, user_data, !discontinuity, is_raw_es))
+	if (!stream_info_queue.try_emplace(stream_address, stream_size, user_data, !discontinuity, raw_es))
 	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
+		return sys_mutex_unlock(ppu, mutex) == CELL_OK ? DMUX_PAMF_INTERNAL_ERROR_BUSY : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	if (!cmd_queue.try_emplace(DmuxPamfCmdType::set_stream))
-	{
-		stream_info_queue.pop();
+	// TODO put into function
+	be_t<u32> result;
+	ensure(cmd_queue.try_emplace(DmuxPamfCmdType::set_stream));
+	ensure(cmd_result_queue.pop(result));
+	ensure(result == static_cast<u32>(DmuxPamfCmdType::set_stream) + 1);
 
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-	}
+	dmux_status = 2; // TODO make enum
 
-	if (be_t<u32> result; !cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::set_stream) + 1)
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
-	}
-
-	dmux_status = 2;
-
-	return CELL_OK;
+	return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
-u32 DmuxPamfContext::enable_es(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, vm::ptr<void> mem_addr, u32 mem_size, vm::bptr<DmuxEsNotifyAuFound> notify_au_found, vm::bptr<void> notify_au_found_arg,
-	vm::bptr<DmuxEsNotifyFlushDone> notify_flush_done, vm::bptr<void> notify_flush_done_arg, bool is_raw_es, vm::bptr<DmuxPamfElementaryStream>& es)
+template <bool raw_es>
+u32 DmuxPamfContext::enable_es(ppu_thread& ppu, u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, vm::ptr<void> mem_addr, u32 mem_size, vm::bptr<DmuxEsNotifyAuFound> notify_au_found,
+	vm::bptr<void> notify_au_found_arg, vm::bptr<DmuxEsNotifyFlushDone> notify_flush_done, vm::bptr<void> notify_flush_done_arg, vm::bptr<DmuxPamfElementaryStream>& es)
 {
-	if (mem_size < dmuxPamfGetEsMemSize(stream_id, private_stream_id, is_avc, es_specific_info, is_raw_es))
+	if (mem_size < dmuxPamfGetEsMemSize<raw_es>(stream_id, private_stream_id, is_avc, es_specific_info))
 	{
 		return DMUX_PAMF_INTERNAL_ERROR_ARG;
 	}
@@ -2266,18 +2469,27 @@ u32 DmuxPamfContext::enable_es(u16 stream_id, u16 private_stream_id, bool is_avc
 		return DMUX_PAMF_INTERNAL_ERROR_ARG;
 	}
 
-	std::lock_guard lock{mutex};
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
+	{
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
 
-	this->is_raw_es = is_raw_es;
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
+
+	this->is_raw_es = raw_es;
 
 	if (enabled_es_num == max_enabled_es_num)
 	{
-		return DMUX_PAMF_INTERNAL_ERROR_NO_MEMORY;
+		return sys_mutex_unlock(ppu, mutex) == CELL_OK ? DMUX_PAMF_INTERNAL_ERROR_NO_MEMORY : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
 	if (find_es(stream_id, private_stream_id)) // Elementary stream already enabled
 	{
-		return DMUX_PAMF_INTERNAL_ERROR_ARG;
+		return sys_mutex_unlock(ppu, mutex) == CELL_OK ? DMUX_PAMF_INTERNAL_ERROR_ARG : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
 	const be_t<u32> au_max_size = [&]() -> be_t<u32>
@@ -2321,140 +2533,222 @@ u32 DmuxPamfContext::enable_es(u16 stream_id, u16 private_stream_id, bool is_avc
 	const auto _es = vm::bptr<DmuxPamfElementaryStream>::make(utils::align(mem_addr.addr(), 0x10));
 
 	const auto au_queue_buffer = vm::bptr<u8>::make(utils::align(_es.addr() + static_cast<u32>(sizeof(DmuxPamfElementaryStream)), 0x80));
-	const be_t<u32> au_specific_info_size = dmuxPamfGetAuSpecificInfoSize(stream_id, private_stream_id, is_avc, is_raw_es);
+	const be_t<u32> au_specific_info_size = dmuxPamfGetAuSpecificInfoSize<raw_es>(stream_id, private_stream_id, is_avc);
 
-	if (!cmd_queue.try_emplace(DmuxPamfCmdType::enable_es, stream_id, private_stream_id, is_avc, au_queue_buffer, dmuxPamfGetAuQueueBufferSize(stream_id, private_stream_id, is_avc, es_specific_info), au_max_size, au_specific_info_size, is_raw_es, next_es_id))
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-	}
+    // TODO put into function
+	be_t<u32> result;
+	ensure(cmd_queue.try_emplace(DmuxPamfCmdType::enable_es, stream_id, private_stream_id, is_avc, au_queue_buffer, dmuxPamfGetAuQueueBufferSize(stream_id, private_stream_id, is_avc, es_specific_info), au_max_size, au_specific_info_size, raw_es, next_es_id));
+	ensure(cmd_result_queue.pop(result));
+    ensure(result == static_cast<u32>(DmuxPamfCmdType::enable_es) + 1);
 
-	if (be_t<u32> result; !cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::enable_es) + 1)
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
-	}
+	u32 es_idx = 0;
+	do es_idx++; while (elementary_streams[es_idx]); // There is guaranteed to be an empty slot, this was already checked above
 
-	u32 i = umax;
-	while (elementary_streams[++i]); // There is guaranteed to be an empty slot, this was already checked above
+    _es->_this = _es;
+	_es->this_size = mem_size;
+    _es->this_index = es_idx;
+	_es->demuxer = _this;
+	_es->notify_au_found = { notify_au_found, notify_au_found_arg };
+	_es->notify_flush_done = { notify_flush_done, notify_flush_done_arg };
+	_es->stream_id = stream_id;
+	_es->private_stream_id = private_stream_id;
+	_es->is_avc = is_avc;
+	_es->au_queue_buffer = au_queue_buffer;
+	_es->au_max_size = au_max_size;
+	_es->au_specific_info_size = au_specific_info_size;
+	_es->skip_next_au = false;
+	_es->es_id = next_es_id++;
 
-	elementary_streams[i] = _es;
-
-	new (_es.get_ptr()) DmuxPamfElementaryStream(_es, mem_size, i, _this, notify_au_found, notify_au_found_arg, notify_flush_done, notify_flush_done_arg, stream_id, private_stream_id, is_avc, au_queue_buffer, au_max_size, au_specific_info_size, next_es_id++);
+	elementary_streams[es_idx] = _es;
 
 	enabled_es_num++;
+
+	if (error_code ret = sys_mutex_unlock(ppu, mutex); ret != CELL_OK)
+    {
+        return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+    }
+
 	es = _es;
 	return CELL_OK;
 }
 
-// TODO
-u32 DmuxPamfContext::reset_stream_and_wait_done()
+u32 DmuxPamfContext::reset_stream_and_wait_done(ppu_thread& ppu)
 {
-	if (reset_stream() != CELL_OK)
+	if (reset_stream(ppu) != CELL_OK)
 	{
 		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	std::lock_guard lock{mutex};
-
-	while (dmux_status != 0)
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
 	{
-		cond.wait(mutex); // TODO lv2_obj::sleep() ?????? check for ppu.is_stopped() ??????????
+		return {};
 	}
 
-	return CELL_OK;
-}
-
-u32 DmuxPamfElementaryStream::free_memory(vm::ptr<void> mem_addr, u32 mem_size)
-{
-	const auto dmux = demuxer.get_ptr();
-
-	std::lock_guard lock{dmux->mutex};
-
-	if (!dmux->cmd_queue.try_emplace(DmuxPamfCmdType::free_memory, mem_addr.addr(), mem_size, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id)))
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-	}
-
-	if (be_t<u32> result; !dmux->cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::free_memory) + 1)
+	if (error_code ret = sys_mutex_lock(ppu, mutex, 0); ret != CELL_OK)
 	{
 		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	dmux->au_released = dmux->au_released.get().set(this_index);
-	dmux->cond.notify_one();
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
 
-	return CELL_OK;
+	while (dmux_status != 0) // TODO make enum
+	{
+		if (error_code ret = sys_cond_wait(ppu, cond, 0); ret != CELL_OK)
+		{
+			sys_mutex_unlock(ppu, mutex);
+			return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+		}
+
+		// TODO savestates
+		if (ppu.state & cpu_flag::again)
+		{
+			return {};
+		}
+	}
+
+	return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
-u32 DmuxPamfElementaryStream::disable_es()
+u32 DmuxPamfElementaryStream::free_memory(ppu_thread& ppu, vm::ptr<void> mem_addr, u32 mem_size) const
+{
+	if (error_code ret = sys_mutex_lock(ppu, demuxer->mutex, 0); ret != CELL_OK)
+	{
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
+
+	// TODO put into function
+	be_t<u32> result;
+	ensure(demuxer->cmd_queue.try_emplace(DmuxPamfCmdType::free_memory, mem_addr.addr(), mem_size, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id)));
+	ensure(demuxer->cmd_result_queue.pop(result));
+	ensure(result == static_cast<u32>(DmuxPamfCmdType::free_memory) + 1);
+
+	demuxer->au_released = demuxer->au_released.get().set(this_index);
+
+	if (error_code ret = sys_cond_signal_to(ppu, demuxer->cond, static_cast<u32>(demuxer->thread_id)); ret != CELL_OK && ret != static_cast<s32>(CELL_EPERM))
+	{
+		sys_mutex_unlock(ppu, demuxer->mutex);
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+	}
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+	{
+		return {};
+	}
+
+	return sys_mutex_unlock(ppu, demuxer->mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
+}
+
+u32 DmuxPamfElementaryStream::disable_es(ppu_thread& ppu)
 {
 	const auto dmux = demuxer.get_ptr();
 
-	std::lock_guard lock{dmux->mutex};
+	if (error_code ret = sys_mutex_lock(ppu, dmux->mutex, 0); ret != CELL_OK)
+    {
+        return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+    }
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+    {
+        return {};
+    }
 
 	if (!dmux->find_es(stream_id, private_stream_id))
 	{
-		return DMUX_PAMF_INTERNAL_ERROR_ARG;
+		return sys_mutex_unlock(ppu, dmux->mutex) == CELL_OK ? DMUX_PAMF_INTERNAL_ERROR_ARG : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	if (!dmux->cmd_queue.try_emplace(DmuxPamfCmdType::disable_es, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id)))
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-	}
+	// TODO put into function
+	be_t<u32> result;
+	ensure(dmux->cmd_queue.try_emplace(DmuxPamfCmdType::disable_es, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id)));
+	ensure(dmux->cmd_result_queue.pop(result));
+    ensure(result == static_cast<u32>(DmuxPamfCmdType::disable_es) + 1);
 
 	const u32 _this_index = this_index;
 
-	this->~DmuxPamfElementaryStream();
+	_this = vm::null;
+	this_size = 0;
+	this_index = 0;
+	demuxer = vm::null;
+	notify_au_found = {};
+	au_queue_buffer = vm::null;
+	unk = 0;
+	au_max_size = 0;
 
 	dmux->elementary_streams[_this_index] = vm::null;
 	dmux->enabled_es_num--;
 
-	if (be_t<u32> result; !dmux->cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::disable_es) + 1)
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
-	}
-
 	dmux->au_released = dmux->au_released.get().set(_this_index);
-	dmux->cond.notify_one();
 
-	return CELL_OK;
+	if (error_code ret = sys_cond_signal_to(ppu, dmux->cond, static_cast<u32>(dmux->thread_id)); ret != CELL_OK && ret != static_cast<s32>(CELL_EPERM))
+    {
+        sys_mutex_unlock(ppu, dmux->mutex);
+        return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+    }
+
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+    {
+        return {};
+    }
+
+	return sys_mutex_unlock(ppu, dmux->mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
-u32 DmuxPamfElementaryStream::flush_es()
+u32 DmuxPamfElementaryStream::flush_es(ppu_thread& ppu) const
 {
-	const auto dmux = demuxer.get_ptr();
+	if (error_code ret = sys_mutex_lock(ppu, demuxer->mutex, 0); ret != CELL_OK)
+    {
+        return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+    }
 
-	std::lock_guard lock{dmux->mutex};
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+    {
+        return {};
+    }
 
-	if (!dmux->cmd_queue.try_emplace(DmuxPamfCmdType::flush_es, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id)))
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-	}
+	// TODO put into function
+	be_t<u32> result;
+	ensure(demuxer->cmd_queue.try_emplace(DmuxPamfCmdType::flush_es, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id)));
+	ensure(demuxer->cmd_result_queue.pop(result));
+    ensure(result == static_cast<u32>(DmuxPamfCmdType::flush_es) + 1);
 
-	if (be_t<u32> result; !dmux->cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::flush_es) + 1)
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
-	}
-
-	return CELL_OK;
+	return sys_mutex_unlock(ppu, demuxer->mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
-u32 DmuxPamfElementaryStream::reset_es()
+u32 DmuxPamfElementaryStream::reset_es(ppu_thread& ppu) const
 {
-	const auto dmux = demuxer.get_ptr();
+	if (error_code ret = sys_mutex_lock(ppu, demuxer->mutex, 0); ret != CELL_OK)
+    {
+        return DMUX_PAMF_INTERNAL_ERROR_FATAL;
+    }
 
-	std::lock_guard lock{dmux->mutex};
+	// TODO savestates
+	if (ppu.state & cpu_flag::again)
+    {
+        return {};
+    }
 
-	if (!dmux->cmd_queue.try_emplace(DmuxPamfCmdType::reset_es, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id), 0))
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_BUSY;
-	}
+	// TODO put into function
+	be_t<u32> result;
+	ensure(demuxer->cmd_queue.try_emplace(DmuxPamfCmdType::reset_es, static_cast<be_t<u32>>(stream_id), static_cast<be_t<u32>>(private_stream_id), 0));
+    ensure(demuxer->cmd_result_queue.pop(result));
+    ensure(result == static_cast<u32>(DmuxPamfCmdType::reset_es) + 1);
 
-	if (be_t<u32> result; !dmux->cmd_result_queue.pop(result) || result != static_cast<u32>(DmuxPamfCmdType::reset_es) + 1)
-	{
-		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
-	}
-
-	return CELL_OK;
+	return sys_mutex_unlock(ppu, demuxer->mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
 
 error_code dmuxPamfGetError(u32 internal_error)
@@ -2528,31 +2822,70 @@ error_code _CellDmuxCoreOpQueryAttr(vm::cptr<CellDmuxPamfSpecificInfo> pamfSpeci
 	return CELL_OK;
 }
 
-u32 dmuxPamfOpen(ppu_thread& ppu, const CellDmuxPamfResource& res, vm::cptr<CellDmuxResourceSpurs> res_spurs, vm::bptr<DmuxNotifyDemuxDone> notify_demux_done, vm::bptr<void> notify_dmux_done_arg, vm::bptr<DmuxNotifyProgEndCode> notify_prog_end_code,
-	vm::bptr<void> notify_prog_end_code_arg, vm::bptr<DmuxNotifyFatalErr> notify_fatal_err, vm::bptr<void> notify_fatal_err_arg, vm::bptr<DmuxPamfContext>& handle)
+u32 DmuxPamfContext::open(ppu_thread& ppu, const CellDmuxPamfResource& res, const DmuxCb<DmuxNotifyDemuxDone>& notify_dmux_done, const DmuxCb<DmuxNotifyProgEndCode>& notify_prog_end_code, const DmuxCb<DmuxNotifyFatalErr>& notify_fatal_err, vm::bptr<DmuxPamfContext>& handle)
 {
-	if (res.ppuThreadPriority >= 0xc00 || res.ppuThreadStackSize < 0x1000 || res.spuThreadPriority >= 0x100 || res.numOfSpus != 1 || !res.memAddr || res.memSize < sizeof(DmuxPamfContext) + 0xe7b)
+	if (res.ppuThreadPriority >= 0xc00u || res.ppuThreadStackSize < 0x1000u || res.spuThreadPriority >= 0x100u || res.numOfSpus != 1u || !res.memAddr || res.memSize < sizeof(DmuxPamfContext) + 0xe7b)
 	{
 		return DMUX_PAMF_INTERNAL_ERROR_ARG;
 	}
 
-	const auto _handle = vm::ptr<DmuxPamfContext>::make(utils::align(+res.memAddr.addr(), 0x80));
+	const auto _this = vm::ptr<DmuxPamfContext>::make(utils::align(+res.memAddr.addr(), 0x80));
 
-	vm::bptr<void> spurs_addr = vm::bptr<void>::make(_handle.addr());
-	b8 use_existing_spurs = false;
+	_this->_this = _this;
+	_this->this_size = res.memSize;
+	_this->version = DMUX_PAMF_VERSION;
+	_this->notify_demux_done = notify_dmux_done;
+	_this->notify_prog_end_code = notify_prog_end_code;
+	_this->notify_fatal_err = notify_fatal_err;
+	_this->resource = res;
+	_this->unk = 0;
+	_this->ppu_thread_stack_size = res.ppuThreadStackSize;
+	_this->au_released = EsBitset{};
+	_this->stream_reset_requested = false;
+	_this->dmux_status = 0; // TODO make enum
+	_this->max_enabled_es_num = MAX_ENABLED_ES_NUM;
+	_this->enabled_es_num = 0;
+	std::ranges::fill(_this->elementary_streams, vm::null);
+	_this->next_es_id = 0;
 
-	if (res_spurs)
+	const vm::var<sys_mutex_attribute_t> mutex_attr = {{ SYS_SYNC_PRIORITY, SYS_SYNC_NOT_RECURSIVE, SYS_SYNC_NOT_PROCESS_SHARED, SYS_SYNC_NOT_ADAPTIVE, 0, 0, 0, { "_dxpmtx"_u64 } }};
+	const vm::var<sys_cond_attribute_t> cond_attr = {{ SYS_SYNC_NOT_PROCESS_SHARED, 0, 0, { "_dxpcnd"_u64 } }};
+
+	if (error_code ret = sys_mutex_create(ppu, _this.ptr(&DmuxPamfContext::mutex), mutex_attr); ret != CELL_OK
+		|| (ret = sys_cond_create(ppu, _this.ptr(&DmuxPamfContext::cond), _this->mutex, cond_attr)) != CELL_OK)
 	{
-		spurs_addr = res_spurs->spurs;
-		use_existing_spurs = true;
+		return DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
 
-	const auto context = new (_handle.get_ptr()) DmuxPamfContext(spurs_addr, use_existing_spurs, _handle, notify_demux_done, notify_dmux_done_arg, notify_prog_end_code, notify_prog_end_code_arg, notify_fatal_err, notify_fatal_err_arg, res);
+	_this->spurs_context_addr = _this.ptr(&DmuxPamfContext::spurs_context);
+	_this->cmd_queue_addr_ = _this.ptr(&DmuxPamfContext::cmd_queue);
+	_this->cmd_queue_buffer_addr_ = _this.ptr(&DmuxPamfContext::cmd_queue_buffer);
+	_this->cmd_queue_addr = _this.ptr(&DmuxPamfContext::cmd_queue);
+	_this->cmd_result_queue_addr = _this.ptr(&DmuxPamfContext::cmd_result_queue);
+	_this->stream_info_queue_addr = _this.ptr(&DmuxPamfContext::stream_info_queue);
+	_this->event_queue_addr = _this.ptr(&DmuxPamfContext::event_queue);
+	_this->cmd_queue_buffer_addr = _this.ptr(&DmuxPamfContext::cmd_queue_buffer);
+	_this->cmd_result_queue_buffer_addr = _this.ptr(&DmuxPamfContext::cmd_result_queue_buffer);
+	_this->event_queue_buffer_addr = _this.ptr(&DmuxPamfContext::event_queue_buffer);
+	_this->stream_info_queue_buffer_addr = _this.ptr(&DmuxPamfContext::stream_info_queue_buffer);
+	_this->cmd_queue_addr__ = _this.ptr(&DmuxPamfContext::cmd_queue);
 
-	context->construct_spu_thread();
+	std::snprintf(_this->spurs_taskset_name, sizeof(_this->spurs_taskset_name), "_libdmux_pamf_%08x", _this.addr());
 
-	handle = _handle;
-	return context->create_thread(ppu);
+	_this->cmd_queue.init(_this->cmd_queue_buffer);
+	_this->cmd_result_queue.init(_this->cmd_result_queue_buffer);
+	_this->stream_info_queue.init(_this->stream_info_queue_buffer);
+	_this->event_queue.init(_this->event_queue_buffer);
+
+	// HLE exclusive
+	_this->au_queue_full = EsBitset{};
+	_this->stream_reset_requested_save = false;
+	_this->stream_reset_in_progress = false;
+
+	_this->run_spu_thread();
+
+	handle = _this;
+	return _this->create_thread(ppu);
 }
 
 error_code _CellDmuxCoreOpOpen(ppu_thread& ppu, vm::cptr<CellDmuxPamfSpecificInfo> pamfSpecificInfo, vm::cptr<CellDmuxResource> demuxerResource, vm::cptr<CellDmuxResourceSpurs> demuxerResourceSpurs, vm::cptr<DmuxCb<DmuxNotifyDemuxDone>> notifyDemuxDone,
@@ -2582,28 +2915,25 @@ error_code _CellDmuxCoreOpOpen(ppu_thread& ppu, vm::cptr<CellDmuxPamfSpecificInf
 
 	ensure(demuxerResource->memAddr.aligned(0x10)); // Not checked on LLE
 
-	vm::ptr<CellDmuxPamfHandle> _handle = vm::static_ptr_cast<CellDmuxPamfHandle>(demuxerResource->memAddr);
-
-	const CellDmuxPamfResource res { demuxerResource->ppuThreadPriority, demuxerResource->ppuThreadStackSize, demuxerResource->numOfSpus, demuxerResource->spuThreadPriority,
-		vm::bptr<void>::make(demuxerResource->memAddr.addr() + sizeof(CellDmuxPamfHandle)), demuxerResource->memSize - sizeof(CellDmuxPamfHandle) };
+	const auto _handle = vm::static_ptr_cast<CellDmuxPamfHandle>(demuxerResource->memAddr);
 
 	_handle->notify_demux_done = *notifyDemuxDone;
 	_handle->notify_fatal_err = *notifyFatalErr;
+	_handle->notify_prog_end_code = *notifyProgEndCode;
 
-	if (pamfSpecificInfo && pamfSpecificInfo->programEndCodeCb)
+	if (!pamfSpecificInfo || !pamfSpecificInfo->programEndCodeCb)
 	{
-		_handle->notify_prog_end_code = *notifyProgEndCode;
+		_handle->notify_prog_end_code.cbFunc = vm::null;
 	}
-	else
-	{
-		_handle->notify_prog_end_code = { vm::null, notifyProgEndCode->cbArg };
-	}
+
+	const CellDmuxPamfResource res{ demuxerResource->ppuThreadPriority, demuxerResource->ppuThreadStackSize, demuxerResource->numOfSpus, demuxerResource->spuThreadPriority,
+		vm::bptr<void>::make(demuxerResource->memAddr.addr() + sizeof(CellDmuxPamfHandle)), demuxerResource->memSize - sizeof(CellDmuxPamfHandle) };
 
 	const auto demux_done_func = vm::bptr<DmuxNotifyDemuxDone>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(dmuxPamfNotifyDemuxDone)));
 	const auto prog_end_code_func = vm::bptr<DmuxNotifyProgEndCode>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(dmuxPamfNotifyProgEndCode)));
 	const auto fatal_err_func = vm::bptr<DmuxNotifyFatalErr>::make(g_fxo->get<ppu_function_manager>().func_addr(FIND_FUNC(dmuxPamfNotifyFatalErr)));
 
-	const u32 error = dmuxPamfOpen(ppu, res, demuxerResourceSpurs, demux_done_func, _handle, prog_end_code_func, _handle, fatal_err_func, _handle, _handle->demuxer);
+	const u32 error = DmuxPamfContext::open(ppu, res, { demux_done_func, _handle }, { prog_end_code_func, _handle }, { fatal_err_func, _handle }, _handle->demuxer);
 
 	*handle = _handle;
 
@@ -2632,14 +2962,6 @@ error_code _CellDmuxCoreOpClose(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> han
 
 error_code _CellDmuxCoreOpResetStream(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> handle)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpResetStream(handle=*0x%x)", handle);
 
 	if (!handle)
@@ -2647,7 +2969,7 @@ error_code _CellDmuxCoreOpResetStream(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandl
 		return CELL_DMUX_PAMF_ERROR_ARG;
 	}
 
-	return dmuxPamfGetError(handle->demuxer->reset_stream());
+	return dmuxPamfGetError(handle->demuxer->reset_stream(ppu));
 }
 
 error_code _CellDmuxCoreOpCreateThread(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> handle)
@@ -2693,14 +3015,6 @@ error_code _CellDmuxCoreOpJoinThread(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle
 template <bool raw_es>
 error_code _CellDmuxCoreOpSetStream(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> handle, vm::cptr<void> streamAddress, u32 streamSize, b8 discontinuity, u64 userData)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpSetStream<raw_es=%d>(handle=*0x%x, streamAddress=*0x%x, streamSize=0x%x, discontinuity=%d, userData=0x%llx)", raw_es, handle, streamAddress, streamSize, +discontinuity, userData);
 
 	if (!streamAddress || streamSize == 0)
@@ -2710,19 +3024,11 @@ error_code _CellDmuxCoreOpSetStream(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle>
 
 	ensure(!!handle); // Not checked on LLE
 
-	return dmuxPamfGetError(handle->demuxer->set_stream(streamAddress, streamSize, discontinuity, static_cast<u32>(userData), raw_es));
+	return dmuxPamfGetError(handle->demuxer->set_stream<raw_es>(ppu, streamAddress, streamSize, discontinuity, static_cast<u32>(userData)));
 }
 
 error_code _CellDmuxCoreOpFreeMemory(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandle> esHandle, vm::ptr<void> memAddr, u32 memSize)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.trace("_CellDmuxCoreOpFreeMemory(esHandle=*0x%x, memAddr=*0x%x, memSize=0x%x)", esHandle, memAddr, memSize);
 
 	if (!memAddr || memSize == 0)
@@ -2732,10 +3038,11 @@ error_code _CellDmuxCoreOpFreeMemory(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHand
 
 	ensure(!!esHandle);
 
-	return dmuxPamfGetError(esHandle->es->free_memory(memAddr, memSize));
+	return dmuxPamfGetError(esHandle->es->free_memory(ppu, memAddr, memSize));
 }
 
-u32 dmuxPamfGetEsAttr(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, bool is_raw_es, CellDmuxPamfEsAttr& attr)
+template <bool raw_es>
+u32 dmuxPamfGetEsAttr(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cptr<void> es_specific_info, CellDmuxPamfEsAttr& attr)
 {
 	if (dmuxPamfStreamIdToTypeChannel(stream_id, private_stream_id).first == DMUX_PAMF_STREAM_TYPE_INDEX_INVALID)
 	{
@@ -2748,8 +3055,8 @@ u32 dmuxPamfGetEsAttr(u16 stream_id, u16 private_stream_id, bool is_avc, vm::cpt
 	}
 
 	attr.auQueueMaxSize = dmuxPamfGetAuQueueMaxSize(stream_id, private_stream_id);
-	attr.memSize = dmuxPamfGetEsMemSize(stream_id, private_stream_id, is_avc, es_specific_info, is_raw_es);
-	attr.specificInfoSize = dmuxPamfGetAuSpecificInfoSize(stream_id, private_stream_id, is_avc, is_raw_es);
+	attr.memSize = dmuxPamfGetEsMemSize<raw_es>(stream_id, private_stream_id, is_avc, es_specific_info);
+	attr.specificInfoSize = dmuxPamfGetAuSpecificInfoSize<raw_es>(stream_id, private_stream_id, is_avc);
 
 	return CELL_OK;
 }
@@ -2778,7 +3085,7 @@ error_code _CellDmuxCoreOpQueryEsAttr(vm::cptr<void> esFilterId, vm::cptr<void> 
 
 	CellDmuxPamfEsAttr es_attr;
 
-	const error_code ret = dmuxPamfGetError(dmuxPamfGetEsAttr(stream_id, private_stream_id, is_avc, esSpecificInfo, raw_es, es_attr));
+	const error_code ret = dmuxPamfGetError(dmuxPamfGetEsAttr<raw_es>(stream_id, private_stream_id, is_avc, esSpecificInfo, es_attr));
 
 	*attr = es_attr;
 	attr->memSize += static_cast<u32>(sizeof(CellDmuxPamfEsHandle));
@@ -2790,14 +3097,6 @@ template <bool raw_es>
 error_code _CellDmuxCoreOpEnableEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> handle, vm::cptr<void> esFilterId, vm::cptr<CellDmuxEsResource> esResource, vm::cptr<DmuxCb<DmuxEsNotifyAuFound>> notifyAuFound,
 	vm::cptr<DmuxCb<DmuxEsNotifyFlushDone>> notifyFlushDone, vm::cptr<void> esSpecificInfo, vm::pptr<CellDmuxPamfEsHandle> esHandle)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpEnableEs<raw_es=%d>(handle=*0x%x, esFilterId=*0x%x, esResource=*0x%x, notifyAuFound=*0x%x, notifyFlushDone=*0x%x, esSpecificInfo=*0x%x, esHandle)",
 		raw_es, handle, esFilterId, esResource, notifyAuFound, notifyFlushDone, esSpecificInfo, esHandle);
 
@@ -2828,8 +3127,8 @@ error_code _CellDmuxCoreOpEnableEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> 
 		return { filter_id->filterIdMajor, filter_id->filterIdMinor, filter_id->supplementalInfo1 };
 	}();
 
-	const u32 error = handle->demuxer->enable_es(stream_id, private_stream_id, is_avc, esSpecificInfo, vm::ptr<void>::make(esResource->memAddr.addr() + sizeof(CellDmuxPamfEsHandle)),
-		esResource->memSize - sizeof(CellDmuxPamfEsHandle), au_found_func, es_handle, flush_done_func, es_handle, raw_es, es_handle->es);
+	const u32 error = handle->demuxer->enable_es<raw_es>(ppu, stream_id, private_stream_id, is_avc, esSpecificInfo, vm::ptr<void>::make(esResource->memAddr.addr() + sizeof(CellDmuxPamfEsHandle)),
+		esResource->memSize - sizeof(CellDmuxPamfEsHandle), au_found_func, es_handle, flush_done_func, es_handle, es_handle->es);
 
 	*esHandle = es_handle;
 
@@ -2838,14 +3137,6 @@ error_code _CellDmuxCoreOpEnableEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> 
 
 error_code _CellDmuxCoreOpDisableEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandle> esHandle)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpDisableEs(esHandle=*0x%x)", esHandle);
 
 	if (!esHandle)
@@ -2853,19 +3144,11 @@ error_code _CellDmuxCoreOpDisableEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandl
 		return CELL_DMUX_PAMF_ERROR_ARG;
 	}
 
-	return dmuxPamfGetError(esHandle->es->disable_es());
+	return dmuxPamfGetError(esHandle->es->disable_es(ppu));
 }
 
 error_code _CellDmuxCoreOpFlushEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandle> esHandle)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpFlushEs(esHandle=*0x%x)", esHandle);
 
 	if (!esHandle)
@@ -2873,19 +3156,11 @@ error_code _CellDmuxCoreOpFlushEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandle>
 		return CELL_DMUX_PAMF_ERROR_ARG;
 	}
 
-	return dmuxPamfGetError(esHandle->es->flush_es());
+	return dmuxPamfGetError(esHandle->es->flush_es(ppu));
 }
 
 error_code _CellDmuxCoreOpResetEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandle> esHandle)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpResetEs(esHandle=*0x%x)", esHandle);
 
 	if (!esHandle)
@@ -2893,19 +3168,11 @@ error_code _CellDmuxCoreOpResetEs(ppu_thread& ppu, vm::ptr<CellDmuxPamfEsHandle>
 		return CELL_DMUX_PAMF_ERROR_ARG;
 	}
 
-	return dmuxPamfGetError(esHandle->es->reset_es());
+	return dmuxPamfGetError(esHandle->es->reset_es(ppu));
 }
 
 error_code _CellDmuxCoreOpResetStreamAndWaitDone(ppu_thread& ppu, vm::ptr<CellDmuxPamfHandle> handle)
 {
-	std::unique_lock savestate_lock{g_fxo->get<hle_locks_t>(), std::try_to_lock};
-
-	if (!savestate_lock.owns_lock())
-	{
-		ppu.state += cpu_flag::again;
-		return {};
-	}
-
 	cellDmuxPamf.notice("_CellDmuxCoreOpResetStreamAndWaitDone(handle=*0x%x)", handle);
 
 	if (!handle)
@@ -2913,7 +3180,7 @@ error_code _CellDmuxCoreOpResetStreamAndWaitDone(ppu_thread& ppu, vm::ptr<CellDm
 		return CELL_DMUX_PAMF_ERROR_ARG;
 	}
 
-	return dmuxPamfGetError(handle->demuxer->reset_stream_and_wait_done());
+	return dmuxPamfGetError(handle->demuxer->reset_stream_and_wait_done(ppu));
 }
 
 static void init_gvar(const vm::gvar<CellDmuxCoreOps>& var)
