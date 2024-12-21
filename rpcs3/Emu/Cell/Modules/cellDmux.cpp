@@ -448,7 +448,7 @@ error_code cellDmuxSetStream(ppu_thread& ppu, vm::ptr<CellDmuxHandle> demuxerHan
 {
 	ppu.state += cpu_flag::wait;
 
-	cellDmux.notice("cellDmuxSetStream(demuxerHandle=*0x%x, streamAddress=*0x%x, streamSize=0x%x, discontinuity=%d, userData=0x%llx)", demuxerHandle, streamAddress, streamSize, +discontinuity, userData);
+	cellDmux.trace("cellDmuxSetStream(demuxerHandle=*0x%x, streamAddress=*0x%x, streamSize=0x%x, discontinuity=%d, userData=0x%llx)", demuxerHandle, streamAddress, streamSize, +discontinuity, userData);
 
 	if (!demuxerHandle || !demuxerHandle->_this || streamSize == 0 || streamSize == umax || demuxerHandle->dmux_type.streamType != CELL_DMUX_STREAM_TYPE_PAMF)
 	{

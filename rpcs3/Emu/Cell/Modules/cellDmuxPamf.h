@@ -89,15 +89,15 @@ public:
 		back = 0;
 	}
 
-	bool pop(T& lhs)
+	/*bool pop(T& lhs)
 	{
 		return _pop<false, true>(&lhs);
-	}
+	}*/
 
-	bool pop()
+	/*bool pop() // TODO remove
 	{
 		return _pop<false, true>(nullptr);
-	}
+	}*/
 
 	bool try_pop(T& lhs)
 	{
@@ -109,22 +109,22 @@ public:
 		return _pop<false, false>(nullptr);
 	}
 
-	template <atomic_wait_timeout timeout>
+	/*template <atomic_wait_timeout timeout>
 	bool try_pop_for(T& lhs)
 	{
 		return _pop<false, true, timeout>(&lhs);
-	}
+	}*/
 
-	template <atomic_wait_timeout timeout>
+	/*template <atomic_wait_timeout timeout>
 	bool try_pop_for()
 	{
 		return _pop<false, true, timeout>(nullptr);
-	}
+	}*/
 
-	bool peek(T& lhs) const
+	/*bool peek(T& lhs) const
 	{
 		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true, true>(&lhs);
-	}
+	}*/
 
 	template <atomic_wait_timeout timeout>
 	bool try_peek_for(T& lhs) const
@@ -132,10 +132,10 @@ public:
 		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true, true, timeout>(&lhs);
 	}
 
-	bool emplace(auto&&... args)
+	/*bool emplace(auto&&... args)
 	{
 		return _emplace<true>(std::forward<decltype(args)>(args)...);
-	}
+	}*/
 
 	bool try_emplace(auto&&... args)
 	{
@@ -152,9 +152,15 @@ public:
 	{
 		return this->_size.observe();
 	}
+
+	template <atomic_wait_timeout timeout>
+	bool wait()
+	{
+		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true, true, timeout>(nullptr);
+	}
 };
 
-enum class DmuxPamfCmdType : u32
+enum class DmuxPamfCommandType : u32
 {
 	enable_es = 0,
 	disable_es = 2,
@@ -169,7 +175,7 @@ enum class DmuxPamfCmdType : u32
 
 struct alignas(0x80) DmuxPamfCommand
 {
-	be_t<DmuxPamfCmdType> type;
+	be_t<DmuxPamfCommandType> type;
 
 	union
 	{
@@ -219,27 +225,27 @@ struct alignas(0x80) DmuxPamfCommand
 
 	DmuxPamfCommand() = default; // Leave queue buffer uninitialized when opening the demuxer
 
-	DmuxPamfCommand(be_t<DmuxPamfCmdType>&& type)
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type)
 		: type(type), other{}
 	{
 	}
 
-	DmuxPamfCommand(be_t<DmuxPamfCmdType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id)
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id)
 		: type(type), disable_flush_es{ stream_id, private_stream_id }
 	{
 	}
 
-	DmuxPamfCommand(be_t<DmuxPamfCmdType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id, const be_t<u64, 4>& unk)
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id, const be_t<u64, 4>& unk)
 		: type(type), reset_es{ stream_id, private_stream_id, unk }
 	{
 	}
 
-	DmuxPamfCommand(be_t<DmuxPamfCmdType>&& type, const be_t<u64, 4>& mem_addr, const be_t<u32>& mem_size, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id)
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u64, 4>& mem_addr, const be_t<u32>& mem_size, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id)
 		: type(type), free_memory{ mem_addr, mem_size, stream_id, private_stream_id }
 	{
 	}
 
-	DmuxPamfCommand(be_t<DmuxPamfCmdType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id, const be_t<u32>& is_avc, const vm::bptr<u8, u64>& au_queue_buffer,
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id, const be_t<u32>& is_avc, const vm::bptr<u8, u64>& au_queue_buffer,
 		const be_t<u32>& au_queue_buffer_size, const be_t<u32>& au_max_size, const be_t<u32>& au_specific_info_size, const be_t<u32>& is_raw_es, const be_t<u32>& es_id)
 		: type(type), enable_es{ stream_id, private_stream_id, is_avc, au_queue_buffer, au_queue_buffer_size, au_max_size, au_specific_info_size, is_raw_es, es_id }
 	{
@@ -871,6 +877,32 @@ CHECK_SIZE(DmuxPamfAuInfo, 0x30);
 
 constexpr u32 DMUX_PAMF_VERSION = 0x280000;
 
+// HLE exclusive, for savestates
+enum class dmux_pamf_state : u8
+{
+	waiting_for_au_released_1_mutex_lock,
+	waiting_for_au_released_1_cond_wait,
+	waiting_for_au_released_1_error,
+	waiting_for_event,
+	starting_demux_done,
+	starting_demux_done_mutex_lock_error,
+	starting_demux_done_mutex_unlock_error,
+	starting_demux_done_waiting,
+	waiting_for_au_released_2_cond_wait,
+	starting_demux_done_waiting_error,
+	setting_au_skip,
+	setting_au_skip_error,
+	executing_cmd,
+	au_found_waiting_for_spu,
+	unsetting_au_skip,
+	demux_done_notifying,
+	demux_done_mutex_lock,
+	demux_done_cond_signal,
+	resume_demux_mutex_lock,
+	resume_demux_waiting_for_spu,
+	send_fatal_err
+};
+
 struct DmuxPamfElementaryStream;
 
 class DmuxPamfContext
@@ -883,8 +915,18 @@ class DmuxPamfContext
 	friend struct DmuxPamfElementaryStream;
 
 
-	alignas(0x80) u8 spurs[0x1000]; // CellSpurs
-	vm::bptr<void> spurs_addr;      // CellSpurs*
+	// HLE exclusive
+	// These are stack variables in the PPU thread function, we put theme here for savestates
+	DmuxPamfEvent event;
+	EsBitset au_queue_full;
+	b8 stream_reset_started;
+	b8 stream_reset_in_progress;
+
+	DmuxPamfSPUThread* hle_spu_thread;
+	dmux_pamf_state savestate;
+
+	u8 spurs[0xf67];           // CellSpurs, 0x1000 bytes on LLE
+	vm::bptr<void> spurs_addr; // CellSpurs*
 	b8 use_existing_spurs;
 
 	alignas(0x80) u8 spurs_taskset[0x1900]; // CellSpursTaskset
@@ -945,16 +987,7 @@ class DmuxPamfContext
 
 	char spurs_taskset_name[24];
 
-	// HLE exclusive
-	DmuxPamfSPUThread* hle_spu_thread;
-	// These are stack variables in the PPU thread function, we put theme here for savestates
-	EsBitset au_queue_full;
-	b8 stream_reset_requested_save;
-	b8 stream_reset_in_progress;
-
-	b8 _skip_waiting_for_au_released_or_stream_reset; // TODO remove
-
-	u8 reserved2[909]; // Unused, 928 bytes on LLE
+	u8 reserved2[928]; // Unused, 928 bytes on LLE
 
 	DmuxPamfHLESpursQueue<DmuxPamfCommand, 1> cmd_queue;            // CellSpursQueue
 	DmuxPamfHLESpursQueue<be_t<u32>, 1> cmd_result_queue;           // CellSpursQueue
@@ -975,6 +1008,8 @@ public:
 
 	DmuxPamfElementaryStream* find_es(u16 stream_id, u16 private_stream_id);
 
+	void exec(ppu_thread& ppu);
+
 	static u32 open(ppu_thread& ppu, const CellDmuxPamfResource& res, const DmuxCb<DmuxNotifyDemuxDone>& notify_dmux_done, const DmuxCb<DmuxNotifyProgEndCode>& notify_prog_end_code, const DmuxCb<DmuxNotifyFatalErr>& notify_fatal_err, vm::bptr<DmuxPamfContext>& handle);
 	u32 create_thread(ppu_thread& ppu);
 	u32 close(ppu_thread& ppu);
@@ -990,13 +1025,18 @@ public:
 
 	u32 reset_stream_and_wait_done(ppu_thread& ppu);
 
-	void exec(ppu_thread& ppu);
 
 private:
-	u32 wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset au_queue_full);
+	template <DmuxPamfCommandType type>
+	void send_spu_command_and_wait(ppu_thread& ppu, bool waiting_for_result, auto&&... cmd_params);
+
+	u32 wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset au_queue_full, b8& stream_reset_started, dmux_pamf_state& savestate);
 
 	template <bool skip>
 	u32 set_au_skip(ppu_thread& ppu);
+
+	template <typename T>
+	static error_code callback(ppu_thread& ppu, DmuxCb<T> cb, auto&&... args);
 };
 
 static_assert(std::is_standard_layout_v<DmuxPamfContext>);
