@@ -14,24 +14,12 @@ class alignas(0x80) DmuxPamfHLESpursQueue
 	u32 front;
 	u32 back;
 
-	template <bool is_peek, bool is_blocking, atomic_wait_timeout timeout = atomic_wait_timeout::inf>
+	template <bool is_peek>
 	bool _pop(T* lhs)
 	{
 		if (_size == 0)
 		{
-			if constexpr (is_blocking)
-			{
-				_size.wait(0, timeout);
-
-				if (_size == 0)
-				{
-					return false;
-				}
-			}
-			else
-			{
-				return false;
-			}
+			return false;
 		}
 
 		if (lhs)
@@ -51,24 +39,35 @@ class alignas(0x80) DmuxPamfHLESpursQueue
 		return true;
 	}
 
-	template <bool is_blocking, atomic_wait_timeout timeout = atomic_wait_timeout::inf>
-	bool _emplace(auto&&... args)
+public:
+	void init(T (&buffer)[max_num_of_entries])
 	{
-		if (_size == max_num_of_entries)
-		{
-			if constexpr (is_blocking)
-			{
-				_size.wait(max_num_of_entries, timeout);
+		this->buffer = buffer;
+		_size = 0;
+		front = 0;
+		back = 0;
+	}
 
-				if (_size == max_num_of_entries)
-				{
-					return false;
-				}
-			}
-			else
-			{
-				return false;
-			}
+	bool pop(T& lhs)
+	{
+		return _pop<false>(&lhs);
+	}
+
+	bool pop()
+	{
+		return _pop<false>(nullptr);
+	}
+
+	bool peek(T& lhs) const
+	{
+		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true>(&lhs);
+	}
+
+	bool emplace(auto&&... args)
+	{
+		if (_size >= max_num_of_entries)
+		{
+			return false;
 		}
 
 		new (&buffer[back]) T(std::forward<decltype(args)>(args)...);
@@ -80,83 +79,14 @@ class alignas(0x80) DmuxPamfHLESpursQueue
 		return true;
 	}
 
-public:
-	void init(T (&buffer)[max_num_of_entries])
-	{
-		this->buffer = buffer;
-		_size = 0;
-		front = 0;
-		back = 0;
-	}
-
-	/*bool pop(T& lhs)
-	{
-		return _pop<false, true>(&lhs);
-	}*/
-
-	/*bool pop() // TODO remove
-	{
-		return _pop<false, true>(nullptr);
-	}*/
-
-	bool try_pop(T& lhs)
-	{
-		return _pop<false, false>(&lhs);
-	}
-
-	bool try_pop()
-	{
-		return _pop<false, false>(nullptr);
-	}
-
-	/*template <atomic_wait_timeout timeout>
-	bool try_pop_for(T& lhs)
-	{
-		return _pop<false, true, timeout>(&lhs);
-	}*/
-
-	/*template <atomic_wait_timeout timeout>
-	bool try_pop_for()
-	{
-		return _pop<false, true, timeout>(nullptr);
-	}*/
-
-	/*bool peek(T& lhs) const
-	{
-		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true, true>(&lhs);
-	}*/
-
-	template <atomic_wait_timeout timeout>
-	bool try_peek_for(T& lhs) const
-	{
-		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true, true, timeout>(&lhs);
-	}
-
-	/*bool emplace(auto&&... args)
-	{
-		return _emplace<true>(std::forward<decltype(args)>(args)...);
-	}*/
-
-	bool try_emplace(auto&&... args)
-	{
-		return _emplace<false>(std::forward<decltype(args)>(args)...);
-	}
-
-	template <atomic_wait_timeout timeout>
-	bool try_emplace_for(auto&&... args)
-	{
-		return _emplace<true, timeout>(std::forward<decltype(args)>(args)...);
-	}
-
 	u32 size() const
 	{
 		return this->_size.observe();
 	}
 
-	template <atomic_wait_timeout timeout>
-	bool wait()
+	void wait() const
 	{
-		return const_cast<DmuxPamfHLESpursQueue<T, max_num_of_entries>*>(this)->template _pop<true, true, timeout>(nullptr);
+		thread_ctrl::wait_on(_size, 0);
 	}
 };
 

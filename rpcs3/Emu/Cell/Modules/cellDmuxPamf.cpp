@@ -1508,7 +1508,7 @@ bool DmuxPamfSPUContext::get_next_cmd(DmuxPamfCommand& lhs, bool new_stream)
 {
 	cellDmuxPamf.trace("Getting next command");
 
-	if (cmd_queue->try_pop(lhs))
+	if (cmd_queue->pop(lhs))
 	{
 		return true;
 	}
@@ -1524,14 +1524,15 @@ bool DmuxPamfSPUContext::get_next_cmd(DmuxPamfCommand& lhs, bool new_stream)
 
 	cellDmuxPamf.trace("No new command and nothing to do, waiting...");
 
-	while (thread_ctrl::state() != thread_state::aborting && !cmd_queue->try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(lhs)){}
+	cmd_queue->wait();
+	//while (thread_ctrl::state() != thread_state::aborting && !cmd_queue->try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(lhs)){}
 
 	if (thread_ctrl::state() == thread_state::aborting)
 	{
 		return false;
 	}
 
-	ensure(cmd_queue->try_pop());
+	ensure(cmd_queue->pop(lhs));
 
 	return true;
 }
@@ -1555,7 +1556,7 @@ bool DmuxPamfSPUContext::send_event(auto&&... args)
 		return false;
 	}
 
-	return ensure(event_queue->try_emplace(std::forward<decltype(args)>(args)..., +event_queue_was_too_full));
+	return ensure(event_queue->emplace(std::forward<decltype(args)>(args)..., +event_queue_was_too_full));
 }
 
 void DmuxPamfSPUContext::operator()() // cellSpursMain()
@@ -1581,7 +1582,7 @@ void DmuxPamfSPUContext::operator()() // cellSpursMain()
 			case DmuxPamfCommandType::enable_es:
 			{
 				max_enqueued_events += 2;
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::enable_es) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::enable_es) + 1));
 				enable_es(static_cast<u8>(cmd.enable_es.stream_id), static_cast<u8>(cmd.enable_es.private_stream_id), static_cast<b8>(cmd.enable_es.is_avc), cmd.enable_es.au_queue_buffer_size, cmd.enable_es.au_queue_buffer,
 					cmd.enable_es.au_max_size, static_cast<b8>(cmd.enable_es.is_raw_es), cmd.enable_es.es_id);
 				break;
@@ -1589,54 +1590,54 @@ void DmuxPamfSPUContext::operator()() // cellSpursMain()
 			case DmuxPamfCommandType::disable_es:
 			{
 				disable_es(static_cast<u8>(cmd.disable_flush_es.stream_id), static_cast<u8>(cmd.disable_flush_es.private_stream_id));
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::disable_es) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::disable_es) + 1));
 				max_enqueued_events -= 2;
 				break;
 			}
 			case DmuxPamfCommandType::set_stream:
 			{
 				new_stream = true;
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::set_stream) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::set_stream) + 1));
 				break;
 			}
 			case DmuxPamfCommandType::free_memory:
 			{
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::free_memory) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::free_memory) + 1));
 				free_memory(cmd.free_memory.mem_size, static_cast<u8>(cmd.free_memory.stream_id), static_cast<u8>(cmd.free_memory.private_stream_id));
 				break;
 			}
 			case DmuxPamfCommandType::flush_es:
 			{
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::flush_es) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::flush_es) + 1));
 				flush_es(cmd.disable_flush_es.stream_id, cmd.disable_flush_es.private_stream_id);
 				break;
 			}
 			case DmuxPamfCommandType::close:
 			{
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::close) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::close) + 1));
 				while (!send_event(DmuxPamfEventType::close));
 				return;
 			}
 			case DmuxPamfCommandType::reset_stream:
 			{
 				reset_stream();
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::reset_stream) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::reset_stream) + 1));
 				break;
 			}
 			case DmuxPamfCommandType::reset_es:
 			{
 				reset_es(cmd.reset_es.stream_id, cmd.reset_es.private_stream_id, vm::ptr<u8, u64>::make(cmd.reset_es.au_addr));
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::reset_es) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::reset_es) + 1));
 				break;
 			}
 			case DmuxPamfCommandType::resume:
 			{
-				ensure(cmd_result_queue->try_emplace(static_cast<u32>(DmuxPamfCommandType::resume) + 1));
+				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::resume) + 1));
 				break;
 			}
 			default:
 			{
-				cmd_result_queue->try_emplace(1000);
+				cmd_result_queue->emplace(1000);
 			}
 			}
 		}
@@ -1651,7 +1652,7 @@ void DmuxPamfSPUContext::operator()() // cellSpursMain()
 			new_stream = false;
 
 			DmuxPamfStreamInfo stream_info;
-			ensure(stream_info_queue->try_pop(stream_info));
+			ensure(stream_info_queue->pop(stream_info));
 
 			demux(&stream_info);
 		}
@@ -1673,13 +1674,14 @@ void DmuxPamfContext::send_spu_command_and_wait(ppu_thread& ppu, bool waiting_fo
 	if (!waiting_for_result)
 	{
 		// The caller is supposed to own the mutex until the SPU thread has consumed the command, so the queue should always be empty here
-		ensure(cmd_queue.try_emplace(type, std::forward<decltype(cmd_params)>(cmd_params)...), "The command queue wasn't empty");
+		ensure(cmd_queue.emplace(type, std::forward<decltype(cmd_params)>(cmd_params)...), "The command queue wasn't empty");
 	}
 
 	// Block until the SPU thread has consumed the command
 	be_t<u32> result{};
 	lv2_obj::sleep(ppu);
-	while (!cmd_result_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(result) && !ppu.is_stopped()){}
+	cmd_result_queue.wait();
+	//while (!cmd_result_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(result) && !ppu.is_stopped()){}
 
 	if (ppu.is_stopped())
 	{
@@ -1689,7 +1691,7 @@ void DmuxPamfContext::send_spu_command_and_wait(ppu_thread& ppu, bool waiting_fo
 
 	ppu.check_state();
 
-	ensure(cmd_result_queue.try_pop());
+	ensure(cmd_result_queue.pop(result));
 	ensure(result == static_cast<u32>(type) + 1, "The HLE SPU thread returned an invalid result");
 }
 
@@ -1872,7 +1874,8 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		cellDmuxPamf.trace("Waiting for the next event...");
 
 		lv2_obj::sleep(ppu);
-		while (!ppu.is_stopped() && !event_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(event)){}
+		event_queue.wait();
+		//while (!ppu.is_stopped() && !event_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(event)){}
 
 		if (ppu.is_stopped())
 		{
@@ -1883,6 +1886,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		// TODO does this properly clear lv2 sleep status, so that the following sys_mutex_lock() calls work properly?
 		ppu.check_state();
 
+		ensure(event_queue.peek(event));
 		cellDmuxPamf.trace("Received event %d", static_cast<u32>(event.type.get()));
 
 		if (event.type == DmuxPamfEventType::demux_done)
@@ -2123,7 +2127,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		}
 		case DmuxPamfEventType::close:
 		{
-			while (event_queue.try_pop()){} // Empty the event queue
+			while (event_queue.pop()){} // Empty the event queue
 			return;
 		}
 		case DmuxPamfEventType::flush_done:
@@ -2171,7 +2175,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		}
 		case DmuxPamfEventType::fatal_error:
 		{
-			ensure(event_queue.try_pop());
+			ensure(event_queue.pop());
 
 			goto send_fatal_err_and_continue;
 		}
@@ -2179,7 +2183,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 			fmt::throw_exception("Invalid event");
 		}
 
-		ensure(event_queue.try_pop());
+		ensure(event_queue.pop());
 
 		// If the event queue gets too full, the SPU thread will stop demuxing until it receives a new command
 		if (enabled_es_num >= 0 && event_queue.size() == 2)
@@ -2199,13 +2203,14 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (enabled_es_num >= 0)
 			{
-				ensure(cmd_queue.try_emplace(DmuxPamfCommandType::resume));
+				ensure(cmd_queue.emplace(DmuxPamfCommandType::resume));
 
 				savestate = dmux_pamf_state::resume_demux_waiting_for_spu;
 				resume_demux_waiting_for_spu:
 
 				lv2_obj::sleep(ppu);
-				while (!cmd_result_queue.wait<static_cast<atomic_wait_timeout>(15'000'000)>() && !ppu.is_stopped()){}
+				cmd_result_queue.wait();
+				//while (!cmd_result_queue.wait<static_cast<atomic_wait_timeout>(15'000'000)>() && !ppu.is_stopped()){}
 
 				if (ppu.is_stopped())
 				{
@@ -2215,7 +2220,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				ppu.check_state();
 
-				ensure(cmd_result_queue.try_pop());
+				ensure(cmd_result_queue.pop());
 			}
 
 			if (sys_mutex_unlock(ppu, mutex) != CELL_OK)
@@ -2827,7 +2832,7 @@ u32 DmuxPamfContext::set_stream(ppu_thread& ppu, vm::cptr<void> stream_address, 
 
 	this->user_data = user_data;
 
-	if (!stream_info_queue.try_emplace(stream_address, stream_size, user_data, !discontinuity, raw_es))
+	if (!stream_info_queue.emplace(stream_address, stream_size, user_data, !discontinuity, raw_es))
 	{
 		return sys_mutex_unlock(ppu, mutex) == CELL_OK ? DMUX_PAMF_INTERNAL_ERROR_BUSY : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 	}
