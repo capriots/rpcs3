@@ -1564,6 +1564,11 @@ void DmuxPamfSPUContext::operator()() // cellSpursMain()
 	while (!Emu.IsRunning())
 	{
 		thread_ctrl::wait_for(5'000);
+
+		if (thread_ctrl::state() == thread_state::aborting)
+        {
+            return;
+        }
 	}
 
 	DmuxPamfCommand cmd;
@@ -1679,6 +1684,8 @@ void DmuxPamfContext::send_spu_command_and_wait(ppu_thread& ppu, bool waiting_fo
 
 	// Block until the SPU thread has consumed the command
 	be_t<u32> result{};
+
+	const bool had_wait = ppu.state.test_and_set(cpu_flag::wait);
 	lv2_obj::sleep(ppu);
 	cmd_result_queue.wait();
 	//while (!cmd_result_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(result) && !ppu.is_stopped()){}
@@ -1689,7 +1696,13 @@ void DmuxPamfContext::send_spu_command_and_wait(ppu_thread& ppu, bool waiting_fo
 		return;
 	}
 
+	lv2_obj::awake(&ppu);
 	ppu.check_state();
+
+	if (had_wait)
+	{
+		ppu.state += cpu_flag::wait;
+	}
 
 	ensure(cmd_result_queue.pop(result));
 	ensure(result == static_cast<u32>(type) + 1, "The HLE SPU thread returned an invalid result");
@@ -1725,7 +1738,7 @@ DmuxPamfElementaryStream* DmuxPamfContext::find_es(u16 stream_id, u16 private_st
 	return ret;
 }
 
-u32 DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset au_queue_full, b8& stream_reset_started, dmux_pamf_state& savestate)
+u32 DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, u64 au_queue_full, b8& stream_reset_started, dmux_pamf_state& savestate)
 {
 	if (savestate == dmux_pamf_state::waiting_for_au_released_1_cond_wait || savestate == dmux_pamf_state::waiting_for_au_released_2_cond_wait)
 	{
@@ -1739,16 +1752,17 @@ u32 DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset 
 
 	if (ppu.state & cpu_flag::again)
 	{
+		cellDmuxPamf.todo("DEBUG 100");
 		return {};
 	}
 
-	if (au_queue_full.any())
+	if (au_queue_full)
 	{
 		cellDmuxPamf.trace("Waiting for AU to be released...");
 
 		savestate = static_cast<dmux_pamf_state>(static_cast<s32>(savestate) + 1);
 
-		while ((au_queue_full & au_released.get()).none() && !stream_reset_requested)
+		while (!(au_queue_full & au_released) && !stream_reset_requested)
 		{
 			cond_wait:
 
@@ -1760,6 +1774,7 @@ u32 DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset 
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 101");
 				return {};
 			}
 		}
@@ -1770,7 +1785,7 @@ u32 DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset 
 	stream_reset_started = stream_reset_requested;
 	stream_reset_requested = false;
 
-	au_released = au_released.get().reset();
+	au_released = 0;
 
 	return sys_mutex_unlock(ppu, mutex) == CELL_OK ? static_cast<error_code>(CELL_OK) : DMUX_PAMF_INTERNAL_ERROR_FATAL;
 }
@@ -1815,8 +1830,8 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 		switch (savestate)
 		{
-		case dmux_pamf_state::waiting_for_au_released_1_mutex_lock: break;
-		case dmux_pamf_state::waiting_for_au_released_1_cond_wait: break;
+		case dmux_pamf_state::waiting_for_au_released_1_mutex_lock: // Same as below
+		case dmux_pamf_state::waiting_for_au_released_1_cond_wait: goto wait_for_au_released;
 		case dmux_pamf_state::waiting_for_au_released_1_error: goto send_err_1;
 		case dmux_pamf_state::waiting_for_event: goto wait_for_event;
 		case dmux_pamf_state::starting_demux_done: goto start_demux_done;
@@ -1854,6 +1869,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 		stream_reset_started = false;
 
 		savestate = dmux_pamf_state::waiting_for_au_released_1_mutex_lock;
+		wait_for_au_released:
 
 		if (wait_au_released_or_stream_reset(ppu, au_queue_full, stream_reset_started, savestate) != CELL_OK)
 		{
@@ -1865,6 +1881,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 		if (ppu.state & cpu_flag::again)
 		{
+			cellDmuxPamf.todo("DEBUG 1");
 			return;
 		}
 
@@ -1873,18 +1890,28 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 		cellDmuxPamf.trace("Waiting for the next event...");
 
-		lv2_obj::sleep(ppu);
-		event_queue.wait();
-		//while (!ppu.is_stopped() && !event_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(event)){}
-
-		if (ppu.is_stopped())
 		{
-			ppu.state += cpu_flag::again;
-			return;
-		}
+			const bool had_wait = ppu.state.test_and_set(cpu_flag::wait);
+			lv2_obj::sleep(ppu);
+			event_queue.wait();
+			//while (!ppu.is_stopped() && !event_queue.try_peek_for<static_cast<atomic_wait_timeout>(15'000'000)>(event)){}
 
-		// TODO does this properly clear lv2 sleep status, so that the following sys_mutex_lock() calls work properly?
-		ppu.check_state();
+			if (ppu.is_stopped())
+			{
+				cellDmuxPamf.todo("DEBUG 2");
+				ppu.state += cpu_flag::again;
+				return;
+			}
+
+			// TODO does this properly clear lv2 sleep status, so that the following sys_mutex_lock() calls work properly?
+			lv2_obj::awake(&ppu);
+			ppu.check_state();
+
+			if (had_wait)
+			{
+				ppu.state += cpu_flag::wait;
+			}
+		}
 
 		ensure(event_queue.peek(event));
 		cellDmuxPamf.trace("Received event %d", static_cast<u32>(event.type.get()));
@@ -1904,6 +1931,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 3");
 				return;
 			}
 
@@ -1918,6 +1946,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 4");
 					return;
 				}
 			}
@@ -1937,6 +1966,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 5");
 					return;
 				}
 			}
@@ -1959,6 +1989,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 6");
 				return;
 			}
 		}
@@ -1977,6 +2008,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 7");
 				return;
 			}
 
@@ -2024,12 +2056,13 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 				if (callback(ppu, es->notify_au_found, es->_this, au_info) != CELL_OK)
 				{
 					// If the callback returns an error, the access unit queue for this elementary stream is full
-					au_queue_full.set(es->this_index);
+					au_queue_full |= 1 << es->this_index;
 					continue;
 				}
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 8");
 					return;
 				}
 
@@ -2042,6 +2075,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 9");
 					savestate = dmux_pamf_state::au_found_waiting_for_spu;
 					return;
 				}
@@ -2072,6 +2106,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 10");
 					return;
 				}
 			}
@@ -2083,6 +2118,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 11");
 				return;
 			}
 
@@ -2096,6 +2132,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 12");
 				return;
 			}
 
@@ -2114,6 +2151,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 13");
 					return;
 				}
 			}
@@ -2139,6 +2177,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 14");
 				return;
 			}
 
@@ -2156,6 +2195,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 				if (ppu.state & cpu_flag::again)
 				{
+					cellDmuxPamf.todo("DEBUG 15");
 					return;
 				}
 			}
@@ -2168,6 +2208,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 16");
 				return;
 			}
 
@@ -2198,6 +2239,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 
 			if (ppu.state & cpu_flag::again)
 			{
+				cellDmuxPamf.todo("DEBUG 17");
 				return;
 			}
 
@@ -2208,17 +2250,27 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 				savestate = dmux_pamf_state::resume_demux_waiting_for_spu;
 				resume_demux_waiting_for_spu:
 
-				lv2_obj::sleep(ppu);
-				cmd_result_queue.wait();
-				//while (!cmd_result_queue.wait<static_cast<atomic_wait_timeout>(15'000'000)>() && !ppu.is_stopped()){}
-
-				if (ppu.is_stopped())
 				{
-					ppu.state += cpu_flag::again;
-					return;
-				}
+					const bool had_wait = ppu.state.test_and_set(cpu_flag::wait);
+					lv2_obj::sleep(ppu);
+					cmd_result_queue.wait();
+					//while (!cmd_result_queue.wait<static_cast<atomic_wait_timeout>(15'000'000)>() && !ppu.is_stopped()){}
 
-				ppu.check_state();
+					if (ppu.is_stopped())
+					{
+						cellDmuxPamf.todo("DEBUG 18");
+						ppu.state += cpu_flag::again;
+						return;
+					}
+
+					lv2_obj::awake(&ppu);
+					ppu.check_state();
+
+					if (had_wait)
+					{
+						ppu.state += cpu_flag::wait;
+					}
+				}
 
 				ensure(cmd_result_queue.pop());
 			}
@@ -2229,7 +2281,7 @@ void DmuxPamfContext::exec(ppu_thread& ppu)
 			}
 		}
 
-		au_queue_full.reset();
+		au_queue_full = 0;
 	}
 }
 
@@ -2240,7 +2292,7 @@ void dmuxPamfEntry(ppu_thread& ppu, vm::ptr<DmuxPamfContext> dmux)
 	if (ppu.state & cpu_flag::again)
 	{
 		dmux->stop_spu_thread();
-		ppu.syscall_args[0] = dmux.addr(); // For savestates, save argument
+		ppu.syscall_args[0] = dmux.addr();
 		return;
 	}
 
@@ -2530,7 +2582,7 @@ u32 DmuxPamfContext::open(ppu_thread& ppu, const CellDmuxPamfResource& res, cons
 	_this->resource = res;
 	_this->unk = 0;
 	_this->ppu_thread_stack_size = res.ppuThreadStackSize;
-	_this->au_released = EsBitset{};
+	_this->au_released = 0;
 	_this->stream_reset_requested = false;
 	_this->sequence_state = DmuxPamfSequenceState::dormant;
 	_this->max_enabled_es_num = MAX_ENABLED_ES_NUM;
@@ -2569,7 +2621,7 @@ u32 DmuxPamfContext::open(ppu_thread& ppu, const CellDmuxPamfResource& res, cons
 
 	// HLE exclusive
 	_this->savestate = {};
-	_this->au_queue_full = EsBitset{};
+	_this->au_queue_full = 0;
 	_this->stream_reset_started = false;
 	_this->stream_reset_in_progress = false;
 
@@ -2900,7 +2952,7 @@ u32 DmuxPamfElementaryStream::free_memory(ppu_thread& ppu, vm::ptr<void> mem_add
 		return {};
 	}
 
-	demuxer->au_released = demuxer->au_released.get().set(this_index);
+	demuxer->au_released |= 1 << this_index;
 
 	cond_signal:
 	if (error_code ret = sys_cond_signal_to(ppu, demuxer->cond, static_cast<u32>(demuxer->thread_id)); ret != CELL_OK && ret != static_cast<s32>(CELL_EPERM))
@@ -3212,7 +3264,7 @@ u32 DmuxPamfElementaryStream::disable_es(ppu_thread& ppu)
 	dmux->elementary_streams[this_index] = vm::null;
 	dmux->enabled_es_num--;
 
-	dmux->au_released = dmux->au_released.get().set(this_index);
+	dmux->au_released |= 1 << this_index;
 
 	this_index = 0;
 

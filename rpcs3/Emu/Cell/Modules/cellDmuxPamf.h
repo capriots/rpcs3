@@ -1,7 +1,5 @@
 #pragma once
 
-#include <bitset>
-
 
 // Common
 
@@ -846,16 +844,13 @@ class DmuxPamfContext
 {
 	static constexpr u32 MAX_ENABLED_ES_NUM = 0x40;
 
-	using EsBitset = std::bitset<MAX_ENABLED_ES_NUM>; // Each bit represents one elementary stream
-	static_assert(sizeof(EsBitset) == sizeof(u64), "std::bitset implementation not suitable");
-
 	friend struct DmuxPamfElementaryStream;
 
 
 	// HLE exclusive
 	// These are stack variables in the PPU thread function, we put theme here for savestates
 	DmuxPamfEvent event;
-	EsBitset au_queue_full;
+	u64 au_queue_full;
 	b8 stream_reset_started;
 	b8 stream_reset_in_progress;
 
@@ -888,7 +883,7 @@ class DmuxPamfContext
 
 	be_t<u32> ppu_thread_stack_size;
 
-	be_t<EsBitset> au_released; // If a bit is set then cellDmuxReleaseAu() was called for that elementary stream
+	be_t<u64> au_released; // If a bit is set then cellDmuxReleaseAu() was called for that elementary stream
 
 	b8 stream_reset_requested;
 
@@ -967,7 +962,7 @@ private:
 	template <DmuxPamfCommandType type>
 	void send_spu_command_and_wait(ppu_thread& ppu, bool waiting_for_result, auto&&... cmd_params);
 
-	u32 wait_au_released_or_stream_reset(ppu_thread& ppu, EsBitset au_queue_full, b8& stream_reset_started, dmux_pamf_state& savestate);
+	u32 wait_au_released_or_stream_reset(ppu_thread& ppu, u64 au_queue_full, b8& stream_reset_started, dmux_pamf_state& savestate);
 
 	template <bool skip>
 	u32 set_au_skip(ppu_thread& ppu);
