@@ -1,9 +1,5 @@
 #pragma once
 
-//----------------------------------------------------------------------------
-// Common stuff (used by both the PPU and SPU threads)
-//----------------------------------------------------------------------------
-
 // Replacement for CellSpursQueue
 template <typename T, u32 max_num_of_entries> requires(std::is_trivial_v<T> && max_num_of_entries > 0)
 class alignas(0x80) dmux_pamf_hle_spurs_queue
@@ -272,284 +268,41 @@ enum DmuxPamfStreamTypeIndex
 // SPU
 //----------------------------------------------------------------------------
 
-constexpr u16 AC3_SYNCWORD = 0x0b77;
-constexpr u16 ATRACX_SYNCWORD = 0x0fd0;
-
-constexpr u16 AC3_FRMSIZE_TABLE[3][38] =
+class dmux_pamf_context
 {
-	{ 0x40, 0x40, 0x50, 0x50, 0x60, 0x60, 0x70, 0x70, 0x80, 0x80, 0xa0, 0xa0, 0xc0, 0xc0, 0xe0, 0xe0, 0x100, 0x100, 0x140, 0x140, 0x180, 0x180, 0x1c0, 0x1c0, 0x200, 0x200, 0x280, 0x280, 0x300, 0x300, 0x380, 0x380, 0x400, 0x400, 0x480, 0x480, 0x500, 0x500 },
-	{ 0x45, 0x46, 0x57, 0x58, 0x68, 0x69, 0x79, 0x7a, 0x8b, 0x8c, 0xae, 0xaf, 0xd0, 0xd1, 0xf3, 0xf4, 0x116, 0x117, 0x15c, 0x15d, 0x1a1, 0x1a2, 0x1e7, 0x1e8, 0x22d, 0x22e, 0x2b8, 0x2b9, 0x343, 0x344, 0x3cf, 0x3d0, 0x45a, 0x45b, 0x4e5, 0x4e6, 0x571, 0x572 },
-	{ 0x60, 0x60, 0x78, 0x78, 0x90, 0x90, 0xa8, 0xa8, 0xc0, 0xc0, 0xf0, 0xf0, 0x120, 0x120, 0x150, 0x150, 0x180, 0x180, 0x1e0, 0x1e0, 0x240, 0x240, 0x2a0, 0x2a0, 0x300, 0x300, 0x3c0, 0x3c0, 0x480, 0x480, 0x540, 0x540, 0x600, 0x600, 0x6c0, 0x6c0, 0x780, 0x780 }
-};
+	static constexpr u16 AC3_SYNCWORD = 0x0b77;
+	static constexpr u16 ATRACX_SYNCWORD = 0x0fd0;
+	static constexpr u8 PACKET_START_CODE_PREFIX = 1;
 
-constexpr s8 PACK_STUFFING_LENGTH_OFFSET = 0xd;
-
-enum start_codes : u32
-{
-	M2V_PIC_START       = 0x100,
-	AVC_AU_DELIMITER    = 0x109,
-	M2V_SEQUENCE_HEADER = 0x1b3,
-	M2V_SEQUENCE_END    = 0x1b7,
-	PACK_START          = 0x1ba,
-	SYSTEM_HEADER       = 0x1bb,
-	PRIVATE_STREAM_1    = 0x1bd,
-	PRIVATE_STREAM_2    = 0x1bf,
-	PROG_END            = 0x1b9,
-	VIDEO_STREAM        = 0x1e0,
-};
-
-struct notify_au_done_params
-{
-	u8 stream_id;
-	u8 private_stream_id;
-	u32 au_size;
-	vm::ptr<u8, u64> au_addr;
-	u64 pts;
-	u64 dts;
-	u32 au_specific_info_size;
-	u64 unk;
-	v128 stream_header_buf;
-	u32 es_id;
-	b8 is_rap;
-};
-
-struct es_0xc0
-{
-	u32 au_cut_status; // 0 = not cutting out an au, 1 = started cutting, 3 = finished cutting, 5 = in the middle of cutting
-
-	//u8 unk_0x04; // Unused
-
-	b8 first_au_delimiter_found;
-
-	u32 current_au_size;
-
-	b8 is_rap;
-
-	u64 pts;
-	u64 dts;
-
-	u32 stream_header_size;
-	v128 stream_header_buf;
-
-	//u32 unk10; // Unused
-
-	v128 prev_packet_cache;
-	u32 cache_start_idx;
-
-	u32 parsed_au_size;
-	u32 au_info_offset;
-	//u32 ac3_sync_info; // Unused
-
-	void reset()
+	static constexpr u16 AC3_FRMSIZE_TABLE[3][38] =
 	{
-		au_cut_status = 0;
-		first_au_delimiter_found = false;
-		current_au_size = 0;
-		is_rap = false;
-		pts = umax;
-		dts = umax;
-		stream_header_size = 0;
-		stream_header_buf = {};
-		parsed_au_size = 0;
-		au_info_offset = 0;
-	}
-};
+		{ 0x40, 0x40, 0x50, 0x50, 0x60, 0x60, 0x70, 0x70, 0x80, 0x80, 0xa0, 0xa0, 0xc0, 0xc0, 0xe0, 0xe0, 0x100, 0x100, 0x140, 0x140, 0x180, 0x180, 0x1c0, 0x1c0, 0x200, 0x200, 0x280, 0x280, 0x300, 0x300, 0x380, 0x380, 0x400, 0x400, 0x480, 0x480, 0x500, 0x500 },
+		{ 0x45, 0x46, 0x57, 0x58, 0x68, 0x69, 0x79, 0x7a, 0x8b, 0x8c, 0xae, 0xaf, 0xd0, 0xd1, 0xf3, 0xf4, 0x116, 0x117, 0x15c, 0x15d, 0x1a1, 0x1a2, 0x1e7, 0x1e8, 0x22d, 0x22e, 0x2b8, 0x2b9, 0x343, 0x344, 0x3cf, 0x3d0, 0x45a, 0x45b, 0x4e5, 0x4e6, 0x571, 0x572 },
+		{ 0x60, 0x60, 0x78, 0x78, 0x90, 0x90, 0xa8, 0xa8, 0xc0, 0xc0, 0xf0, 0xf0, 0x120, 0x120, 0x150, 0x150, 0x180, 0x180, 0x1e0, 0x1e0, 0x240, 0x240, 0x2a0, 0x2a0, 0x300, 0x300, 0x3c0, 0x3c0, 0x480, 0x480, 0x540, 0x540, 0x600, 0x600, 0x6c0, 0x6c0, 0x780, 0x780 }
+	};
 
-struct es_0x10
-{
-	const u8* addr;
-	u32 au_size;
-	u32 processed_size;
+	static constexpr u16 PACK_SIZE = 0x800;
+	static constexpr s8 PACK_STUFFING_LENGTH_OFFSET = 0xd;
 
-	u32 prev_bytes_size;
-	v128 prev_bytes;
 
-	s32 remaining_bytes_to_parse;
-	// v128 unk_0x30; // Unused
-
-	void reset()
+	enum start_codes : u32
 	{
-		addr = nullptr;
-		au_size = 0;
-		processed_size = 0;
-		prev_bytes_size = 0;
-		prev_bytes = {};
-		remaining_bytes_to_parse = 0;
-	}
-};
+		M2V_PIC_START       = 0x100,
+		AVC_AU_DELIMITER    = 0x109,
+		M2V_SEQUENCE_HEADER = 0x1b3,
+		M2V_SEQUENCE_END    = 0x1b7,
+		PACK_START          = 0x1ba,
+		SYSTEM_HEADER       = 0x1bb,
+		PRIVATE_STREAM_1    = 0x1bd,
+		PRIVATE_STREAM_2    = 0x1bf,
+		PROG_END            = 0x1b9,
+		VIDEO_STREAM_BASE   = 0x1e0, // The lower 4 bits indicate the channel
+	};
 
-struct au_queue
-{
-	// v128 buf; // LLE stores the last pos & alignof(v128) - 1 bytes due to SPU shenanigans, we don't need that
 
-	vm::ptr<u8, u64> addr;
-
-	u32 freed_mem_size;
-	u32 pos;
-	u32 end_pos;
-
-	u32 size;
-	u32 au_max_size;
-
-	void push(es_0x10& unk2);
-
-	void init(vm::ptr<u8, u64> addr, u32 size, u32 au_max_size)
-	{
-		this->addr = addr;
-		this->freed_mem_size = 0;
-		this->pos = 0;
-		this->end_pos = 0;
-		this->size = size;
-		this->au_max_size = au_max_size;
-	}
-};
-
-struct demux_es
-{
-	b8 is_enabled;
-
-	u32 _switch;
-	// u32 unk0x08; // Unused
-
-	es_0x10 unk0x10;
-
-	u32 parse_stream_result;
-
-	u64 pts;
-	u64 dts;
-
-	b8 is_rap;
-
-	u32 stream_header_size;
-
-	v128 stream_header_buf;
-
-	u32 (demux_es::*parse_stream)(const u8* input_addr, u32 input_size, es_0x10& unk4);
-
-	au_queue _au_queue;
-
-	es_0xc0 unk0xc0;
-
-	notify_au_done_params au_done_params;
-
-	u32 au_found_num;
-
-	//u32 m2v_sequence_header_code_found_num; // Unused
-
-	b8 start_of_au;
-	u32 au_size; // Only used for user data streams since they don't have sync words
-
-	b8 is_avc;
-
-	void reset()
-	{
-		_switch = 0;
-		parse_stream_result = 0;
-		is_rap = false;
-		stream_header_size = 0;
-		stream_header_buf = {};
-	}
-
-	void reset_timestamps()
-	{
-		pts = umax;
-		dts = umax;
-	}
-
-	template <bool is_avc>
-	u32 parse_video(const u8* input_addr, u32 input_size, es_0x10& unk4);
-	u32 parse_lpcm(const u8* input_addr, u32 input_size, es_0x10& unk4);
-	template <bool is_ac3>
-	u32 parse_audio(const u8* input_addr, u32 input_size, es_0x10& unk4);
-	u32 parse_user_data(const u8* input_addr, u32 input_size, es_0x10& unk4);
-};
-
-struct alignas(0x10) demux_pack_finder
-{
-	// This class is currently not used by the HLE implementation
-
-	// u32 found_code;    // Indicates if a start code was found and which one
-	// const u8* addr;    // Start address of search area
-	// s32 pos;           // Current position in search area
-	// u32 matched_bytes; // The last three bytes could be the beginning of start code. This indicates, if one, two or three bytes match the beginning of a start code
-
-	void reset()
-	{
-		// found_code = 0;
-		// addr = nullptr;
-		// pos = 0;
-		// matched_bytes = 0;
-	}
-};
-
-struct demux_0x30
-{
-	u32 main_switchUNK; // TODO make enum
-	// u32 unk0x04; // Error code? Unused
-
-	// v128 invalid_bytes; // Unused
-	const u8* PES_header_addr; // On LLE: v128 PES_header_buf
-
-	// u32 input_addr_low; // Unused
-
-	const u8* input_addr;
-
-	const u8* unk0x38; // input addr ???
-
-	const u8* end_of_pes_packet;
-
-	s32 unk0x40; // pes_packet_remaining_size ???
-
-	s32 unk0x44; // Unused ???
-
-	s32 pes_packet_remaining_size;
-	// u32 pes_header_size; // Unused
-
-	u32 type_idx;
-	u32 channel;
-
-	u32 sequence_stateUNK; // TODO make enum
-
-	void reset()
-	{
-		main_switchUNK = 0;
-		// PES_header_buf = {};
-		input_addr = nullptr;
-		unk0x44 = 0;
-		pes_packet_remaining_size = 0;
-		type_idx = 0;
-		channel = 0;
-		sequence_stateUNK = 4;
-	}
-};
-
-struct demux_input_stream
-{
-	s32 bytes_to_process;
-
-	// We don't need this, we can read the stream inplace instead of copying it like the LLE SPU thread does
-	// s32 buffer_remaining_size;
-	// u32 buffer_pos;
-
-	u32 pos;
-	u32 size;
-	vm::cptr<u8, u64> addr;
-	// u32 dma_count; // Unnecessary
-
-	void init(vm::cptr<void, u64> addr, u32 size)
-	{
-		bytes_to_process = 0;
-		pos = 0;
-		this->size = size;
-		this->addr = vm::static_ptr_cast<const u8>(addr);
-	}
-};
-
-class dmux_pamf_spu_context
-{
 	// These are globals on LLE
 
-	// We don't need these, we can read and write directly to guest memory instead of DMA'ing like the LLE SPU thread does
+	// We don't need these since we can read and write directly to PPU memory instead of DMA'ing like the LLE SPU thread does
 	// alignas(0x80) u8 input_buffer[0x4000];
 	// alignas(0x80) u8 output_buffer[0x4080];
 
@@ -558,7 +311,7 @@ class dmux_pamf_spu_context
 	dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>* stream_info_queue;
 	dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 132>* event_queue;
 
-	b8 au_queue_no_memory;
+	b8 au_queue_full;
 	b8 event_queue_too_full;
 	b8 event_queue_was_too_full;
 	u32 max_enqueued_events;
@@ -570,26 +323,283 @@ class dmux_pamf_spu_context
 	bool new_stream;
 
 
-	// These are part of a class on LLE
+	// These are part of a class with one global instance on LLE
 
 	u32 demux_done;
 	u32 demux_done_was_notified;
 
-	demux_input_stream input_stream;
+	struct input_stream
+	{
+		s32 bytes_to_process; // TODO name
 
-	demux_0x30 unk0x30;
-	demux_pack_finder unk0x90;
+		// We don't need this since we read the stream inplace instead of copying it like the LLE SPU thread does
+		// s32 buffer_remaining_size;
+		// u32 buffer_pos;
+
+		u32 pos;
+		u32 size;
+		vm::cptr<u8, u64> addr;
+		// u32 dma_count; // Incremented every time the LLE DMA's part of the stream into its buffer. Unused afterward
+
+		void init(vm::cptr<void, u64> addr, u32 size)
+		{
+			bytes_to_process = 0;
+			pos = 0;
+			this->size = size;
+			this->addr = vm::static_ptr_cast<const u8>(addr);
+		}
+	}
+	input_stream;
+
+	struct demuxer
+	{
+		enum class state : u32
+		{
+			initial,
+			refreshing_buffer_and_finding_start_code,
+			parsing_pack_header,
+			verifying_start_of_pes_packet,
+			parsing_system_header,
+			parsing_pes_packet_header,
+			parsing_elementary_stream_header,
+			parsing_elementary_stream,
+			found_prog_end_code
+		}
+		state; // Current demuxing state
+
+		// u32 unk0x04;  // Error code? Set on certain parsing failures. Unused afterward
+		// v128 unk0x10; // Sometimes used to store part of the stream that contained an error. Unused afterward
+
+		const u8* pes_packet_header; // Address of the pes packet in the current pack (v128 on LLE, stores the entire header)
+
+		// u32 current_addr_low; // Sometimes set to the low four bits of current_addr. Unused otherwise
+		const u8* current_addr;  // Current parsing address
+
+		const u8* pes_packet_data; // Only used if an audio stream access unit is larger than indicated in its header, current_addr is then set to this member + 1 to skip one byte of the elementary stream
+
+		const u8* end_of_pes_packet; // Address of the end of the current pes packet
+
+		s32 pes_packet_data_size; // Only used if an audio stream access unit is larger than indicated in its header, pes_packet_remaining_size is then set to this member - 1 to skip one byte of the elementary stream
+
+		// Used if the parameters in the stream indicate that the current pack is larger than 0x800 bytes. Since packs in a PAMF stream should always be 0x800 bytes in size, this should never happen.
+		// If it does happen, a demux done event is sent to the user and the stream would be reset afterward, so this member ends up unused
+		// s32 unk0x44;
+
+		s32 pes_packet_remaining_size; // end_of_pes_packet - current_addr
+
+		// u32 pes_header_size; // Set but never used
+
+		u32 type_idx; // Type of the elementary stream in the current pes packet
+		u32 channel;  // Channel of the elementary stream in the current pes packet
+
+		// u32 unk_state;
+
+		void reset()
+		{
+			// pes_header_addr, pes_packet_data, end_of_pes_packet, and pes_packet_data_size aren't reset
+
+			state = state::initial;
+			// pes_header_buf = {};
+			current_addr = nullptr;
+			// unk0x44 = 0;
+			pes_packet_remaining_size = 0;
+			type_idx = 0;
+			channel = 0;
+			// unk_state = 4;
+		}
+	}
+	unk0x30; // TODO
+
+	struct alignas(0x10) demux_pack_finder // TODO name
+	{
+		// This class is currently not used by the HLE implementation
+
+		// u32 found_code;    // Indicates if a start code was found and which one
+		// const u8* addr;    // Start address of search area
+		// s32 pos;           // Current position in search area
+		// u32 matched_bytes; // The last three bytes could be the beginning of start code. This indicates, if one, two, or three bytes match the beginning of a start code
+
+		void reset()
+		{
+			// found_code = 0;
+			// addr = nullptr;
+			// pos = 0;
+			// matched_bytes = 0;
+		}
+	}
+	unk0x90; // TODO
 
 	// u8 unk[0x20]; // Unused
 
-	demux_es elementary_streams[5][0x10];
+	struct elementary_stream
+	{
+		b8 is_enabled;
 
-	b8 is_raw_es;
-	DmuxPamfStreamTypeIndex es_type_idx;
+		u32 _switch; // TODO
+		// u32 unk0x08; // Unused
 
-	// u32 packs_found_num;                     // Unused
-	// u32 pes_packets_found_num;               // Unused
-	// u32 invalid_packet_start_code_found_num; // Unused
+		struct es_0x10
+		{
+			const u8* addr;
+			u32 au_size;
+			u32 processed_size;
+
+			u32 prev_bytes_size;
+			v128 prev_bytes;
+
+			s32 remaining_bytes_to_parse;
+			// v128 unk_0x30; // Unused
+
+			void reset()
+			{
+				addr = nullptr;
+				au_size = 0;
+				processed_size = 0;
+				prev_bytes_size = 0;
+				prev_bytes = {};
+				remaining_bytes_to_parse = 0;
+			}
+		}
+		unk0x10; // TODO
+
+		u32 parse_stream_result;
+
+		u64 pts;
+		u64 dts;
+
+		b8 is_rap;
+
+		u32 stream_header_size;
+
+		v128 stream_header_buf;
+
+		u32 (elementary_stream::*parse_stream)(const u8* input_addr, u32 input_size, es_0x10& unk4);
+
+		struct access_unit_queue
+		{
+			// v128 buf; // LLE stores the last pos & alignof(v128) - 1 bytes due to SPU shenanigans, we don't need that
+
+			vm::ptr<u8, u64> addr;
+
+			u32 freed_mem_size;
+			u32 pos;
+			u32 end_pos;
+
+			u32 size;
+			u32 au_max_size;
+
+			void write(es_0x10& unk2);
+
+			void init(vm::ptr<u8, u64> addr, u32 size, u32 au_max_size)
+			{
+				this->addr = addr;
+				this->freed_mem_size = 0;
+				this->pos = 0;
+				this->end_pos = 0;
+				this->size = size;
+				this->au_max_size = au_max_size;
+			}
+		}
+		access_unit_queue;
+
+		struct es_0xc0
+		{
+			u32 au_cut_status; // 0 = not cutting out an au, 1 = started cutting, 2 = error (?), 3 = finished cutting, 5 = in the middle of cutting
+
+			// u8 unk_0x04; // Unused
+
+			b8 first_au_delimiter_found;
+
+			u32 current_au_size;
+
+			b8 is_rap;
+
+			u64 pts;
+			u64 dts;
+
+			u32 stream_header_size;
+			v128 stream_header_buf;
+
+			// u32 unk10; // Unused
+
+			v128 prev_packet_cache;
+			u32 cache_start_idx;
+
+			u32 parsed_au_size;
+			u32 au_info_offset;
+			// u32 ac3_sync_info; // Unused
+
+			void reset()
+			{
+				au_cut_status = 0;
+				first_au_delimiter_found = false;
+				current_au_size = 0;
+				is_rap = false;
+				pts = umax;
+				dts = umax;
+				stream_header_size = 0;
+				stream_header_buf = {};
+				parsed_au_size = 0;
+				au_info_offset = 0;
+			}
+		}
+		unk0xc0;
+
+		struct notify_au_done_params
+		{
+			u8 stream_id;
+			u8 private_stream_id;
+			u32 au_size;
+			vm::ptr<u8, u64> au_addr;
+			u64 pts;
+			u64 dts;
+			u32 au_specific_info_size;
+			u64 unk;
+			v128 stream_header_buf;
+			u32 es_id;
+			b8 is_rap;
+		}
+		au_done_params;
+
+		u32 au_found_num;
+
+		// u32 m2v_sequence_header_code_found_num; // Unused
+
+		b8 start_of_au;
+		u32 au_size; // Only used for user data streams since they don't have sync words
+
+		b8 is_avc;
+
+		void reset()
+		{
+			_switch = 0;
+			parse_stream_result = 0;
+			is_rap = false;
+			stream_header_size = 0;
+			stream_header_buf = {};
+		}
+
+		void reset_timestamps()
+		{
+			pts = umax;
+			dts = umax;
+		}
+
+		template <bool is_avc>
+		u32 parse_video(const u8* input_addr, u32 input_size, es_0x10& unk4);
+		u32 parse_lpcm(const u8* input_addr, u32 input_size, es_0x10& unk4);
+		template <bool is_ac3>
+		u32 parse_audio(const u8* input_addr, u32 input_size, es_0x10& unk4);
+		u32 parse_user_data(const u8* input_addr, u32 input_size, es_0x10& unk4);
+	}
+	elementary_streams[5][0x10]; // TODO description
+
+	b8 raw_es;       // Indicates that the input stream is a raw elementary stream instead of a multiplexed MPEG Program Stream. If set to true, MPEG-PS related parsing will be skipped
+	u32 es_type_idx; // Indicates the type of the elementary stream if raw_es is true (this info is normally part of the MPEG-PS container)
+
+	// u32 packs_found;       // Incremented if a pack is found. Unused afterward
+	// u32 pes_packets_found; // Incremented if a PES packet is found. Unused afterward
+	// u32 packs_found;       // Incremented if the PES start code prefix is not found after a pack header. Unused afterward
 
 	bool enable_es(u8 stream_id, u8 private_stream_id, b8 is_avc, u32 au_queue_buffer_size, vm::ptr<u8, u64> au_queue_buffer, u32 au_max_size, b8 is_raw_es, u32 es_id);
 	bool disable_es(u8 stream_id, u8 private_stream_id);
@@ -599,18 +609,22 @@ class dmux_pamf_spu_context
 	bool reset_es(u8 stream_id, u8 private_stream_id, vm::ptr<u8, u64> au_addr);
 	void discard_access_units();
 
-	bool send_au_done(notify_au_done_params& params);
+	bool send_au_done(elementary_stream::notify_au_done_params& params);
 
-	inline bool check_and_notify_demux_done();
-	inline bool check_demux_done_was_notified();
 	bool demux(const DmuxPamfStreamInfo* stream_info);
 
-public:
-	dmux_pamf_spu_context(){} // For savestates, prevent zero-initialization when default constructing the thread
+	// These are labels in the LLE demux function. LLE jumps to these before returning from that function
+	inline bool set_demux_done();
+	template <bool set_au_queue_full>
+	inline bool check_demux_done();
+	inline bool check_demux_done_was_notified();
 
-	dmux_pamf_spu_context(dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>* cmd_queue, dmux_pamf_hle_spurs_queue<be_t<u32>, 1>* cmd_result_queue, dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>* stream_info_queue, dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 132>* event_queue)
-		: cmd_queue(cmd_queue), cmd_result_queue(cmd_result_queue), stream_info_queue(stream_info_queue), event_queue(event_queue), au_queue_no_memory(), event_queue_too_full(), event_queue_was_too_full(), max_enqueued_events(4)
-		, new_stream(), demux_done(true), demux_done_was_notified(true), input_stream(), unk0x30{ 0, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 4 }, unk0x90(), elementary_streams(), is_raw_es(), es_type_idx()
+public:
+	dmux_pamf_context() {} // For savestates, prevent zero-initialization when default constructing the thread
+
+	dmux_pamf_context(dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>* cmd_queue, dmux_pamf_hle_spurs_queue<be_t<u32>, 1>* cmd_result_queue, dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>* stream_info_queue, dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 132>* event_queue)
+		: cmd_queue(cmd_queue), cmd_result_queue(cmd_result_queue), stream_info_queue(stream_info_queue), event_queue(event_queue), au_queue_full(), event_queue_too_full(), event_queue_was_too_full(), max_enqueued_events(4)
+		, new_stream(), demux_done(true), demux_done_was_notified(true), input_stream(), unk0x30(), unk0x90(), elementary_streams(), raw_es(), es_type_idx()
 	{
 	}
 
@@ -618,7 +632,7 @@ public:
 	static constexpr auto thread_name = "PAMF Demuxer Thread"sv;
 };
 
-using dmux_pamf_spu_thread = named_thread<dmux_pamf_spu_context>;
+using dmux_pamf_thread = named_thread<dmux_pamf_context>;
 
 
 //----------------------------------------------------------------------------
@@ -633,15 +647,6 @@ enum CellDmuxPamfError
 	CELL_DMUX_PAMF_ERROR_UNKNOWN_STREAM = 3,
 	CELL_DMUX_PAMF_ERROR_NO_MEMORY = 5,
 	CELL_DMUX_PAMF_ERROR_FATAL = 6,
-};
-
-enum DmuxPamfInternalError
-{
-	DMUX_PAMF_INTERNAL_ERROR_ARG = 1,
-	DMUX_PAMF_INTERNAL_ERROR_NO_MEMORY = 2,
-	DMUX_PAMF_INTERNAL_ERROR_UNKNOWN_STREAM = 3,
-	DMUX_PAMF_INTERNAL_ERROR_BUSY = 5,
-	DMUX_PAMF_INTERNAL_ERROR_FATAL = 6,
 };
 
 enum CellDmuxPamfM2vLevel
@@ -839,7 +844,7 @@ struct DmuxPamfElementaryStream;
 
 class DmuxPamfContext
 {
-	static constexpr u32 MAX_ENABLED_ES_NUM = 0x40;
+	static constexpr s32 MAX_ENABLED_ES_NUM = 0x40;
 
 	friend struct DmuxPamfElementaryStream;
 
@@ -852,7 +857,7 @@ class DmuxPamfContext
 	b8 stream_reset_in_progress;
 
 	b8 spu_thread_running;
-	dmux_pamf_spu_thread* hle_spu_thread;
+	dmux_pamf_thread* hle_spu_thread;
 	dmux_pamf_state savestate;
 
 	[[maybe_unused]] u8 spurs[0xf67]; // CellSpurs, 0x1000 bytes on LLE
@@ -887,7 +892,7 @@ class DmuxPamfContext
 
 	be_t<DmuxPamfSequenceState> sequence_state;
 
-	be_t<u32> max_enabled_es_num;
+	be_t<s32> max_enabled_es_num;
 	be_t<s32> enabled_es_num;
 	vm::bptr<DmuxPamfElementaryStream> elementary_streams[MAX_ENABLED_ES_NUM];
 
@@ -930,7 +935,7 @@ class DmuxPamfContext
 	DmuxPamfEvent event_queue_buffer[132];
 
 	alignas(0x80) u8 spurs_context[0x36400];
-	static_assert(sizeof(spurs_context) >= sizeof(dmux_pamf_spu_thread)); // We can put the thread here
+	static_assert(sizeof(spurs_context) >= sizeof(dmux_pamf_thread)); // We can put the thread here
 
 
 	template <DmuxPamfCommandType type>
@@ -945,7 +950,7 @@ class DmuxPamfContext
 	static error_code callback(ppu_thread& ppu, DmuxCb<F> cb, auto&&... args);
 
 public:
-	void run_spu_thread() { hle_spu_thread = new (&spurs_context) dmux_pamf_spu_thread(&cmd_queue, &cmd_result_queue, &stream_info_queue, &event_queue); }
+	void run_spu_thread() { hle_spu_thread = new (&spurs_context) dmux_pamf_thread(&cmd_queue, &cmd_result_queue, &stream_info_queue, &event_queue); }
 	void stop_spu_thread() const { hle_spu_thread->~named_thread(); }
 
 	DmuxPamfElementaryStream* find_es(u16 stream_id, u16 private_stream_id);
