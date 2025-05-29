@@ -392,6 +392,10 @@ class dmux_pamf_context
 
 	struct elementary_stream
 	{
+		const u8 stream_id;
+		const u8 private_stream_id;
+		const u32 es_id;
+
 		u32 _switch = 0; // TODO
 
 		struct es_0x10
@@ -424,7 +428,7 @@ class dmux_pamf_context
 
 		bool is_rap = false;
 
-		const u32 stream_header_size;
+		const u32 au_specific_info_size;
 		v128 stream_header_buf{};
 
 		struct access_unit_queue
@@ -438,7 +442,7 @@ class dmux_pamf_context
 			const u32 size;
 			const u32 au_max_size;
 
-			access_unit_queue(vm::ptr<u8> addr, u32 size, u32 au_max_size) : addr(addr), size(size), au_max_size(au_max_size) {}
+			access_unit_queue(vm::ptr<u8> addr, u32 size, u32 au_max_size) : addr(addr), size(size), au_max_size(au_max_size == umax || au_max_size > size ? 0x800 : au_max_size) {}
 
 			void write(const es_0x10& unk2);
 
@@ -455,16 +459,15 @@ class dmux_pamf_context
 		{
 			u32 au_cut_status = 0; // 0 = not cutting out an au, 1 = started cutting, 2 = error (?), 3 = finished cutting, 5 = in the middle of cutting
 
-			bool first_au_delimiter_found = false;
-
 			u32 current_au_size = 0;
-
-			bool is_rap = false;
 
 			u64 pts = umax;
 			u64 dts = umax;
 
-			u32 stream_header_size = 0;
+			bool first_au_delimiter_found = false;
+
+			bool is_rap = false;
+
 			v128 stream_header_buf{};
 
 			v128 prev_packet_cache{};
@@ -481,7 +484,6 @@ class dmux_pamf_context
 				is_rap = false;
 				pts = umax;
 				dts = umax;
-				stream_header_size = 0;
 				stream_header_buf = {};
 				parsed_au_size = 0;
 				au_info_offset = 0;
@@ -489,29 +491,22 @@ class dmux_pamf_context
 		}
 		unk0xc0;
 
-		struct notify_au_found_params
+		struct au_params
 		{
-			const u8 stream_id;
-			const u8 private_stream_id;
-			u32 au_size = 0;
-			vm::ptr<u8, u64> au_addr = vm::null;
-			u64 pts = umax;
-			u64 dts = umax;
-			u32 au_specific_info_size = 0;
-			u64 unk = 0;
-			v128 stream_header_buf{};
-			const u32 es_id;
-			bool is_rap = false;
-
-			notify_au_found_params(u32 stream_id, u32 private_stream_id, u32 es_id) : stream_id(stream_id), private_stream_id(private_stream_id), es_id(es_id) {}
+			v128 stream_header_buf;
+			u32 au_size;
+			vm::ptr<u8> au_addr;
+			u64 pts;
+			u64 dts;
+			bool is_rap;
 		}
-		au_found_params;
+		au_params{};
 
 		bool start_of_au = false; // TODO rename
 		u32 au_size = 0;
 
-		elementary_stream(u32 stream_header_size, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size, u32 stream_id, u32 private_stream_id, u32 es_id)
-			: stream_header_size(stream_header_size), access_unit_queue(au_queue_buffer, au_queue_buffer_size, au_max_size), au_found_params(stream_id, private_stream_id, es_id)
+		elementary_stream(u32 stream_id, u32 private_stream_id, u32 es_id, u32 stream_header_size, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
+			: stream_id(stream_id), private_stream_id(private_stream_id), es_id(es_id), au_specific_info_size(stream_header_size), access_unit_queue(au_queue_buffer, au_queue_buffer_size, au_max_size)
 		{
 		}
 
@@ -537,26 +532,26 @@ class dmux_pamf_context
 	template <bool is_avc>
 	struct video_stream : elementary_stream
 	{
-		video_stream(vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size, u32 stream_id, u32 private_stream_id, u32 es_id) : elementary_stream(0, au_queue_buffer, au_queue_buffer_size, au_max_size, stream_id, private_stream_id, es_id) {}
+		video_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
 		u32 parse_stream(const u8* input_addr, u32 input_size, es_0x10& unk4) override;
 	};
 
 	struct lpcm_stream : elementary_stream
 	{
-		lpcm_stream(vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size, u32 stream_id, u32 private_stream_id, u32 es_id) : elementary_stream(3, au_queue_buffer, au_queue_buffer_size, au_max_size, stream_id, private_stream_id, es_id) {}
+		lpcm_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 3, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
 		u32 parse_stream(const u8* input_addr, u32 input_size, es_0x10& unk4) override;
 	};
 
 	template <bool is_ac3>
 	struct audio_stream : elementary_stream
 	{
-		audio_stream(vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size, u32 stream_id, u32 private_stream_id, u32 es_id) : elementary_stream(0, au_queue_buffer, au_queue_buffer_size, au_max_size, stream_id, private_stream_id, es_id) {}
+		audio_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
 		u32 parse_stream(const u8* input_addr, u32 input_size, es_0x10& unk4) override;
 	};
 
 	struct user_data_stream : elementary_stream
 	{
-		user_data_stream(vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size, u32 stream_id, u32 private_stream_id, u32 es_id) : elementary_stream(0, au_queue_buffer, au_queue_buffer_size, au_max_size, stream_id, private_stream_id, es_id) {}
+		user_data_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
 		u32 parse_stream(const u8* input_addr, u32 input_size, es_0x10& unk4) override;
 	};
 
@@ -574,7 +569,7 @@ class dmux_pamf_context
 	bool reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<u8> au_addr);
 	void discard_access_units();
 
-	bool send_au_found(elementary_stream::notify_au_found_params& params);
+	bool send_au_found(u8 stream_id, u8 private_stream_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size, v128 stream_header_buf, u32 es_id, bool is_rap);
 
 	bool demux(const DmuxPamfStreamInfo* stream_info);
 
@@ -836,7 +831,6 @@ class DmuxPamfContext
 	b8 stream_reset_started;
 	b8 stream_reset_in_progress;
 
-	b8 spu_thread_running;
 	u32 hle_spu_thread_id;
 	dmux_pamf_state savestate;
 
