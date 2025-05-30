@@ -71,6 +71,7 @@ void dmux_pamf_context::elementary_stream::access_unit_queue::write(const es_0x1
 	pos += unk2.prev_bytes_size + unk2.au_size;
 }
 
+// TODO check sizes
 template <bool is_avc>
 u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, u32 input_size, es_0x10& unk4)
 {
@@ -84,7 +85,7 @@ u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, 
 
 	if (unk0xc0.cache_start_idx != 0)
 	{
-		const v128 buf[2] = { unk0xc0.prev_packet_cache, read_from_ptr<v128>(input_addr) };
+		const v128 buf[2] = { unk0xc0.prev_packet_cache, read_from_ptr<v128>(input_addr) }; // TODO check sizes
 
 		for (u32 i = unk0xc0.cache_start_idx; i < sizeof(v128); i++)
 		{
@@ -507,7 +508,7 @@ bool dmux_pamf_context::flush_es(u32 stream_id, u32 private_stream_id)
 
 		es.unk0xc0.current_au_size = au_size;
 
-		send_au_found(es.stream_id, es.private_stream_id, es.access_unit_queue.addr + au_start_offset, es.unk0xc0.pts, es.unk0xc0.dts, au_size, es.au_specific_info_size, es.au_params.stream_header_buf, es.es_id, es.unk0xc0.is_rap);
+		send_au_found(es.stream_id, es.private_stream_id, es.es_id, es.access_unit_queue.addr + au_start_offset, es.unk0xc0.pts, es.unk0xc0.dts, au_size, es.au_specific_info_size, es.unk0xc0.stream_header_buf, es.unk0xc0.is_rap);
 	}
 
 	es.au_size = 0;
@@ -1130,18 +1131,15 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 				es._switch = 4;
 				[[fallthrough]];
 			}
-			case 4: // set au done params
+			case 4:
 			{
 				if (es.unk0xc0.au_cut_status == 3)
 				{
-					es.au_params.au_addr = es.access_unit_queue.addr + es.access_unit_queue.pos - es.unk0xc0.current_au_size;
-					es.au_params.au_size = es.unk0xc0.current_au_size;
-
 					if (!es.start_of_au && es.unk0x10.prev_bytes_size == 0)
 					{
-						es.au_params.is_rap = es.is_rap;
-						es.au_params.pts = es.pts;
-						es.au_params.dts = es.dts;
+						es.unk0xc0.is_rap = es.is_rap;
+						es.unk0xc0.pts = es.pts;
+						es.unk0xc0.dts = es.dts;
 
 						es.is_rap = false;
 						es.reset_timestamps();
@@ -1149,12 +1147,7 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 					else
 					{
 						es.start_of_au = false;
-						es.au_params.pts = es.unk0xc0.pts;
-						es.au_params.dts = es.unk0xc0.dts;
-						es.au_params.is_rap = es.unk0xc0.is_rap;
 					}
-
-					es.au_params.stream_header_buf = es.unk0xc0.stream_header_buf;
 				}
 
 				es._switch = 5;
@@ -1164,7 +1157,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 			{
 				if (es.unk0xc0.au_cut_status == 3)
 				{
-					if (!send_au_found(es.stream_id, es.private_stream_id, es.au_params.au_addr, es.au_params.pts, es.au_params.dts, es.au_params.au_size, es.au_specific_info_size, es.au_params.stream_header_buf, es.es_id, es.au_params.is_rap))
+					if (!send_au_found(es.stream_id, es.private_stream_id, es.es_id, es.access_unit_queue.addr + es.access_unit_queue.pos - es.unk0xc0.current_au_size, es.unk0xc0.pts, es.unk0xc0.dts,
+						es.unk0xc0.current_au_size, es.au_specific_info_size, es.unk0xc0.stream_header_buf, es.unk0xc0.is_rap))
 					{
 						return check_demux_done<false>();
 					}
@@ -1262,7 +1256,7 @@ bool dmux_pamf_context::get_next_cmd(DmuxPamfCommand& lhs, bool new_stream) cons
 	return true;
 }
 
-bool dmux_pamf_context::send_au_found(u8 stream_id, u8 private_stream_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size, v128 stream_header_buf, u32 es_id, bool is_rap)
+bool dmux_pamf_context::send_au_found(u8 stream_id, u8 private_stream_id, u32 es_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size, v128 stream_header_buf, bool is_rap)
 {
 	if (!send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, au_addr.addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(pts)),
 		std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(dts)), 0, au_size, au_specific_info_size, std::bit_cast<std::array<u8, sizeof(v128)>>(stream_header_buf), es_id, is_rap))
@@ -1415,7 +1409,7 @@ void DmuxPamfContext::send_spu_command_and_wait(ppu_thread& ppu, bool waiting_fo
 	}
 
 	be_t<u32> result{};
-	ensure(cmd_result_queue.pop(result));
+	ensure(cmd_result_queue.pop(result), "The result queue was empty");
 	ensure(result == static_cast<u32>(type) + 1, "The HLE SPU thread sent an invalid result");
 }
 
@@ -1983,7 +1977,6 @@ void dmuxPamfEntry(ppu_thread& ppu, vm::ptr<DmuxPamfContext> dmux)
 
 	if (ppu.state & cpu_flag::again)
 	{
-		//dmux->stop_spu_thread();
 		ppu.syscall_args[0] = dmux.addr();
 		return;
 	}

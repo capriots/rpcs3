@@ -80,7 +80,8 @@ public:
 
 	void wait() const
 	{
-		thread_ctrl::wait_on(_size, 0);
+		while (_size == 0 && thread_ctrl::state() != thread_state::aborting)
+			_size.wait(0, static_cast<atomic_wait_timeout>(10'000'000));
 	}
 };
 
@@ -491,17 +492,6 @@ class dmux_pamf_context
 		}
 		unk0xc0;
 
-		struct au_params
-		{
-			v128 stream_header_buf;
-			u32 au_size;
-			vm::ptr<u8> au_addr;
-			u64 pts;
-			u64 dts;
-			bool is_rap;
-		}
-		au_params{};
-
 		bool start_of_au = false; // TODO rename
 		u32 au_size = 0;
 
@@ -569,7 +559,7 @@ class dmux_pamf_context
 	bool reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<u8> au_addr);
 	void discard_access_units();
 
-	bool send_au_found(u8 stream_id, u8 private_stream_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size, v128 stream_header_buf, u32 es_id, bool is_rap);
+	bool send_au_found(u8 stream_id, u8 private_stream_id, u32 es_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size, v128 stream_header_buf, bool is_rap);
 
 	bool demux(const DmuxPamfStreamInfo* stream_info);
 
