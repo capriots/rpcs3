@@ -312,10 +312,10 @@ class dmux_pamf_context
 	const vm::ptr<dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>> stream_info_queue;
 	const vm::ptr<dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 132>> event_queue;
 
-	b8 au_queue_full = false;
-	b8 event_queue_too_full = false;
-	b8 event_queue_was_too_full = false;
-	u32 max_enqueued_events = 4;
+	bool au_queue_full = false;
+	bool event_queue_too_full = false;
+	bool event_queue_was_too_full = false; // TODO check if necessary
+	u32 max_enqueued_events = 4; // 4 + 2 per enabled stream
 
 	bool get_next_cmd(DmuxPamfCommand& lhs, bool new_stream) const;
 	bool send_event(auto&&... args);
@@ -356,12 +356,6 @@ class dmux_pamf_context
 		enum class state : u32
 		{
 			initial,
-			refreshing_buffer_and_finding_start_code,
-			parsing_pack_header,
-			verifying_start_of_pes_packet,
-			parsing_system_header,
-			parsing_pes_packet_header,
-			parsing_elementary_stream_header,
 			parsing_elementary_stream,
 			found_prog_end_code
 		}
@@ -461,7 +455,7 @@ class dmux_pamf_context
 			u64 pts = umax;
 			u64 dts = umax;
 
-			bool first_au = false;
+			bool first_au_found = false; // TODO rename currently cutting out au
 
 			bool is_rap = false;
 
@@ -476,7 +470,7 @@ class dmux_pamf_context
 			void reset()
 			{
 				au_cut_status = 0;
-				first_au = false;
+				first_au_found = false;
 				size = 0;
 				is_rap = false;
 				pts = umax;
@@ -490,6 +484,21 @@ class dmux_pamf_context
 
 		bool au_timestamps_rap_set = false;
 		u32 au_size = 0;
+
+		template <u32 unk_size_mask>
+		u32 parse_audio_stream_header(const u8* stream_header)
+		{
+			u32 unk_size = 0;
+
+			if (au_size == 0)
+			{
+				unk_size = read_from_ptr<be_t<u32>>(&stream_header[1]) >> 8 & unk_size_mask;
+				ensure(unk_size != unk_size_mask); // This case is bugged on LLE, likely never happens with valid streams
+				au_size = 1;
+			}
+
+			return unk_size + 4;
+		}
 
 		elementary_stream(u32 stream_id, u32 private_stream_id, u32 es_id, u32 au_specific_info_size, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
 			: stream_id(stream_id), private_stream_id(private_stream_id), es_id(es_id), au_specific_info_size(au_specific_info_size), access_unit_queue(au_queue_buffer, au_queue_buffer_size, au_max_size)
@@ -523,22 +532,6 @@ class dmux_pamf_context
 
 		virtual u32 parse_private_stream_header(const u8* stream_header, const u8* pes_packet_header) = 0;
 		virtual u32 parse_stream(const u8* input_addr, u32 input_size) = 0;
-
-	protected:
-		template <u32 unk_size_mask>
-		u32 parse_audio_stream_header(const u8* stream_header)
-		{
-			u32 unk_size = 0;
-
-			if (au_size == 0)
-			{
-				unk_size = read_from_ptr<be_t<u32>>(&stream_header[1]) >> 8 & unk_size_mask;
-				ensure(unk_size != unk_size_mask); // This case is bugged on LLE, likely never happens with valid streams
-				au_size = 1;
-			}
-
-			return unk_size + 4;
-		}
 	};
 
 	template <bool is_avc>
@@ -578,9 +571,13 @@ class dmux_pamf_context
 
 		u32 parse_private_stream_header(const u8* stream_header, const u8* pes_packet_header) override
 		{
-			ensure(static_cast<s8>(pes_packet_header[7]) < 0); // PTS field exists // TODO check
-			au_size = read_from_ptr<be_t<u32>>(&stream_header[2]) - 4;
-			return 10;
+			if (static_cast<s8>(pes_packet_header[7]) < 0) // PTS field exists
+			{
+				au_size = read_from_ptr<be_t<u32>>(&stream_header[2]) - 4;
+				return 10;
+			}
+
+			return 2;
 		}
 
 		u32 parse_stream(const u8* input_addr, u32 input_size) override;
@@ -600,15 +597,12 @@ class dmux_pamf_context
 	void reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<u8> au_addr);
 	void discard_access_units();
 
-	bool send_au_found(u8 stream_id, u8 private_stream_id, u32 es_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size,  const std::array<u8, 0x10>& au_specific_info_buf, bool is_rap);
-
 	bool demux(const DmuxPamfStreamInfo* stream_info);
 
 	// These are labels in the LLE demux function. LLE jumps to these before returning from that function
 	inline bool set_demux_done();
 	template <bool set_au_queue_full>
 	inline bool set_au_queue_full_and_check_demux_done();
-	inline bool check_demux_done_was_notified();
 
 public:
 	static constexpr u32 id_base = 0xf0000000;
@@ -852,11 +846,8 @@ struct DmuxPamfElementaryStream;
 
 class DmuxPamfContext
 {
-	friend struct DmuxPamfElementaryStream;
-
-
 	// HLE exclusive
-	// These are stack variables in the PPU thread function, they're here for savestates
+	// These are local variables in the PPU thread function, they're here for savestates
 	DmuxPamfEvent event;
 	u64 au_queue_full_bitset;
 	b8 stream_reset_started;
@@ -873,7 +864,7 @@ class DmuxPamfContext
 	[[maybe_unused]] be_t<u32> spurs_task_id;                // CellSpursTaskId
 	vm::bptr<void> spurs_context_addr;
 
-	[[maybe_unused]] u8 reserved1[0x10]; // Unused
+	[[maybe_unused]] u8 reserved1[0x10];
 
 	vm::bptr<DmuxPamfContext> _this;
 	be_t<u32> this_size;
@@ -907,14 +898,14 @@ class DmuxPamfContext
 	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>> cmd_queue_addr_; // Same as cmd_queue_addr, unused
 	vm::bptr<DmuxPamfCommand[1]> cmd_queue_buffer_addr_;                     // Same as cmd_queue_buffer_addr, unused
 
-	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>> cmd_queue_addr;            // CellSpursQueue*
-	vm::bptr<dmux_pamf_hle_spurs_queue<be_t<u32>, 1>> cmd_result_queue_addr;           // CellSpursQueue*
-	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>> stream_info_queue_addr; // CellSpursQueue*
-	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 132>> event_queue_addr;          // CellSpursQueue*
+	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>> cmd_queue_addr;                                    // CellSpursQueue*
+	vm::bptr<dmux_pamf_hle_spurs_queue<be_t<u32>, 1>> cmd_result_queue_addr;                                   // CellSpursQueue*
+	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>> stream_info_queue_addr;                         // CellSpursQueue*
+	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 4 + 2 * DMUX_PAMF_MAX_ENABLED_ES_NUM>> event_queue_addr; // CellSpursQueue*
 
 	vm::bptr<DmuxPamfCommand[1]> cmd_queue_buffer_addr;
 	vm::bptr<be_t<u32>[1]> cmd_result_queue_buffer_addr;
-	vm::bptr<DmuxPamfEvent[132]> event_queue_buffer_addr;
+	vm::bptr<DmuxPamfEvent[4 + 2 * DMUX_PAMF_MAX_ENABLED_ES_NUM]> event_queue_buffer_addr;
 	vm::bptr<DmuxPamfStreamInfo[1]> stream_info_queue_buffer_addr;
 
 	vm::bptr<dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>> cmd_queue_addr__; // Same as cmd_queue_addr, unused
@@ -929,18 +920,17 @@ class DmuxPamfContext
 
 	[[maybe_unused]] u8 reserved2[928]; // Unused
 
-	dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1> cmd_queue;            // CellSpursQueue
-	dmux_pamf_hle_spurs_queue<be_t<u32>, 1> cmd_result_queue;           // CellSpursQueue
-	dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1> stream_info_queue; // CellSpursQueue
-	dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 132> event_queue;          // CellSpursQueue
+	dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1> cmd_queue;                                    // CellSpursQueue
+	dmux_pamf_hle_spurs_queue<be_t<u32>, 1> cmd_result_queue;                                   // CellSpursQueue
+	dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1> stream_info_queue;                         // CellSpursQueue
+	dmux_pamf_hle_spurs_queue<DmuxPamfEvent, 4 + 2 * DMUX_PAMF_MAX_ENABLED_ES_NUM> event_queue; // CellSpursQueue
 
 	DmuxPamfCommand cmd_queue_buffer[1];
 	alignas(0x80) be_t<u32> cmd_result_queue_buffer[1];
 	DmuxPamfStreamInfo stream_info_queue_buffer[1];
-	DmuxPamfEvent event_queue_buffer[132];
+	DmuxPamfEvent event_queue_buffer[4 + 2 * DMUX_PAMF_MAX_ENABLED_ES_NUM];
 
 	alignas(0x80) u8 spurs_context[0x36400];
-	static_assert(sizeof(spurs_context) >= sizeof(dmux_pamf_thread)); // We can put the thread here // TODO remove
 
 
 	template <DmuxPamfCommandType type>
@@ -953,6 +943,8 @@ class DmuxPamfContext
 
 	template <typename F>
 	static error_code callback(ppu_thread& ppu, DmuxCb<F> cb, auto&&... args);
+
+	friend struct DmuxPamfElementaryStream;
 
 public:
 	void run_spu_thread(){ hle_spu_thread_id = idm::make<dmux_pamf_thread>(cmd_queue_addr, cmd_result_queue_addr, stream_info_queue_addr, event_queue_addr); }

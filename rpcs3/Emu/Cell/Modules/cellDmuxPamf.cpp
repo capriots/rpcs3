@@ -77,7 +77,7 @@ u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, 
 {
 	const u8* cutout_start_addr = nullptr;
 
-	if (access_unit.first_au)
+	if (access_unit.first_au_found)
 	{
 		cutout_start_addr = input_addr;
 		access_unit.au_cut_status = 5;
@@ -91,7 +91,7 @@ u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, 
 		{
 			if (be_t<u32> code = read_from_ptr<be_t<u32>>(&buf->_bytes[i]); (is_avc && code == AVC_AU_DELIMITER) || (!is_avc && (code == M2V_PIC_START || code == M2V_SEQUENCE_HEADER || code == M2V_SEQUENCE_END)))
 			{
-				if (access_unit.first_au)
+				if (access_unit.first_au_found)
 				{
 					unk0x10.addr = cutout_start_addr;
 					unk0x10.processed_size = 0;
@@ -115,7 +115,7 @@ u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, 
 
 				cutout_start_addr = input_addr;
 				access_unit.au_cut_status = 1;
-				access_unit.first_au = is_avc || code == M2V_PIC_START;
+				access_unit.first_au_found = is_avc || code == M2V_PIC_START;
 			}
 		}
 	}
@@ -125,7 +125,7 @@ u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, 
 	{
 		if (be_t<u32> code = read_from_ptr<be_t<u32>>(&input_addr[i]); (is_avc && code == AVC_AU_DELIMITER) || (!is_avc && (code == M2V_PIC_START || code == M2V_SEQUENCE_HEADER || code == M2V_SEQUENCE_END)))
 		{
-			if (access_unit.first_au)
+			if (access_unit.first_au_found)
 			{
 				if (!is_avc && code == M2V_SEQUENCE_END)
 				{
@@ -142,7 +142,7 @@ u32 dmux_pamf_context::video_stream<is_avc>::parse_stream(const u8* input_addr, 
 				access_unit.au_cut_status = 1;
 			}
 
-			access_unit.first_au = is_avc || code == M2V_PIC_START;
+			access_unit.first_au_found = is_avc || code == M2V_PIC_START;
 		}
 	}
 
@@ -221,40 +221,21 @@ u32 dmux_pamf_context::audio_stream<is_ac3>::parse_stream(const u8* input_addr, 
 {
 	const u8* cutout_start_addr = nullptr;
 
-	if (access_unit.first_au)
+	if (access_unit.first_au_found)
 	{
 		cutout_start_addr = input_addr;
 		access_unit.au_cut_status = 5;
 	}
 
-	const u32 old_cache_start_idx = access_unit.cache_start_idx;
-	v128 buf[2]{ access_unit.prev_packet_cache, read_from_ptr<v128>(input_addr) };
-
-	u32 buf_size = sizeof(v128);
-
-	for (s32 input_pos = old_cache_start_idx != 0 ? -static_cast<s32>(sizeof(v128)) : 0; input_pos <= static_cast<s64>(input_size - sizeof(u32)); input_pos += sizeof(v128), access_unit.cache_start_idx = 0)
+	if (access_unit.cache_start_idx != 0)
 	{
-		if (input_pos >= 0)
-		{
-			buf[0] = buf[1];
+		const v128 buf[2] = { access_unit.prev_packet_cache, read_from_ptr<v128>(input_addr) }; // TODO check sizes
 
-			if (input_size - input_pos > sizeof(v128))
-			{
-				buf[1] = read_from_ptr<v128>(input_addr + input_pos + sizeof(v128));
-			}
-			else
-			{
-				buf_size = input_size - input_pos - 3;
-			}
-		}
-
-		for (u32 i = access_unit.cache_start_idx; i < buf_size; i++)
+		for (u32 i = access_unit.cache_start_idx; i < sizeof(v128); i++)
 		{
 			if (be_t<u16> tmp = read_from_ptr<be_t<u16>>(&buf->_bytes[i]); access_unit.au_info_offset != 0)
 			{
-				access_unit.au_info_offset--;
-
-				if (access_unit.au_info_offset == 0)
+				if (--access_unit.au_info_offset == 0)
 				{
 					access_unit.parsed_size = 0;
 
@@ -269,49 +250,97 @@ u32 dmux_pamf_context::audio_stream<is_ac3>::parse_stream(const u8* input_addr, 
 					{
 						if ((tmp & 0x3ff) < 0x200)
 						{
-							access_unit.parsed_size = ((tmp & 0x3ff) + 1) * 8 + 8 /* TODO sizeof ats header*/;
+							access_unit.parsed_size = ((tmp & 0x3ff) + 1) * 8 + 8; // TODO sizeof ats header
 						}
 					}
 				}
 			}
 			else if ((is_ac3 && tmp == AC3_SYNCWORD) || (!is_ac3 && tmp == ATRACX_SYNCWORD))
 			{
-				if (!access_unit.first_au)
+				if (!access_unit.first_au_found)
 				{
-					cutout_start_addr = input_pos < 0 ? input_addr : input_addr + input_pos + i;
+					cutout_start_addr = input_addr;
 
-					access_unit.first_au = true;
+					access_unit.first_au_found = true;
 					access_unit.au_info_offset = is_ac3 ? sizeof(u16) * 2 : sizeof(u16);
 					access_unit.au_cut_status = 1;
 					continue;
 				}
 
-				if (input_pos >= 0)
+				const u32 processed_size = 0;
+				const u32 prev_bytes_size = i - access_unit.cache_start_idx;
+
+				if (u32 current_au_size = access_unit.size + processed_size + prev_bytes_size; current_au_size >= access_unit.parsed_size)
 				{
 					unk0x10.addr = cutout_start_addr;
-					unk0x10.processed_size = static_cast<u32>(input_addr + input_pos + i - cutout_start_addr);
-					unk0x10.au_size = static_cast<u32>(input_addr + input_pos + i - cutout_start_addr);
-					unk0x10.remaining_bytes_to_parse = 0;
-					unk0x10.prev_bytes_size = old_cache_start_idx ? sizeof(v128) - old_cache_start_idx : 0;
-					std::memcpy(&unk0x10.prev_bytes, &access_unit.prev_packet_cache._bytes[old_cache_start_idx], sizeof(v128) - old_cache_start_idx);
-				}
-				else
-				{
-					unk0x10.addr = cutout_start_addr;
-					unk0x10.processed_size = 0;
+					unk0x10.processed_size = processed_size;
 					unk0x10.remaining_bytes_to_parse = 0;
 					unk0x10.au_size = 0;
-					unk0x10.prev_bytes_size = i - access_unit.cache_start_idx;
-					std::memcpy(&unk0x10.prev_bytes, &access_unit.prev_packet_cache._bytes[old_cache_start_idx], sizeof(v128) - old_cache_start_idx);
+					unk0x10.prev_bytes_size = prev_bytes_size;
+					std::memcpy(&unk0x10.prev_bytes, &access_unit.prev_packet_cache._bytes[access_unit.cache_start_idx], sizeof(v128) - access_unit.cache_start_idx);
 					access_unit.cache_start_idx = i;
-				}
 
-				if (u32 current_au_size = access_unit.size + unk0x10.prev_bytes_size + unk0x10.au_size; current_au_size >= access_unit.parsed_size)
-				{
 					access_unit.au_cut_status = current_au_size == access_unit.parsed_size ? 3 : 2;
 					access_unit.size += unk0x10.prev_bytes_size + unk0x10.au_size;
 					return access_unit.au_cut_status;
 				}
+			}
+		}
+	}
+
+	s64 i = 0;
+	for (; i <= static_cast<s64>(input_size - sizeof(u32)); i++)
+	{
+		if (be_t<u16> tmp = read_from_ptr<be_t<u16>>(&input_addr[i]); access_unit.au_info_offset != 0)
+		{
+			if (--access_unit.au_info_offset == 0)
+			{
+				access_unit.parsed_size = 0;
+
+				if constexpr (is_ac3)
+				{
+					if (u8 fscod = tmp >> 14, frmsizecod = (tmp >> 8) & 0x3f; fscod < 3 && frmsizecod < 38)
+					{
+						access_unit.parsed_size = AC3_FRMSIZE_TABLE[fscod][frmsizecod] * sizeof(s16);
+					}
+				}
+				else
+				{
+					if ((tmp & 0x3ff) < 0x200)
+					{
+						access_unit.parsed_size = ((tmp & 0x3ff) + 1) * 8 + 8; // TODO sizeof ats header
+					}
+				}
+			}
+		}
+		else if ((is_ac3 && tmp == AC3_SYNCWORD) || (!is_ac3 && tmp == ATRACX_SYNCWORD))
+		{
+			if (!access_unit.first_au_found)
+			{
+				cutout_start_addr = input_addr + i;
+
+				access_unit.first_au_found = true;
+				access_unit.au_info_offset = is_ac3 ? sizeof(u16) * 2 : sizeof(u16);
+				access_unit.au_cut_status = 1;
+				continue;
+			}
+
+			const u32 processed_size = static_cast<u32>(input_addr + i - cutout_start_addr);
+			const u32 prev_bytes_size = access_unit.cache_start_idx ? sizeof(v128) - access_unit.cache_start_idx : 0;
+
+			if (u32 current_au_size = access_unit.size + processed_size + prev_bytes_size; current_au_size >= access_unit.parsed_size)
+			{
+				unk0x10.addr = cutout_start_addr;
+				unk0x10.processed_size = processed_size;
+				unk0x10.au_size = processed_size;
+				unk0x10.remaining_bytes_to_parse = 0;
+				unk0x10.prev_bytes_size = prev_bytes_size;
+				std::memcpy(&unk0x10.prev_bytes, &access_unit.prev_packet_cache._bytes[access_unit.cache_start_idx], sizeof(v128) - access_unit.cache_start_idx);
+				access_unit.cache_start_idx = 0;
+
+				access_unit.au_cut_status = current_au_size == access_unit.parsed_size ? 3 : 2;
+				access_unit.size += unk0x10.prev_bytes_size + unk0x10.au_size;
+				return access_unit.au_cut_status;
 			}
 		}
 	}
@@ -327,8 +356,8 @@ u32 dmux_pamf_context::audio_stream<is_ac3>::parse_stream(const u8* input_addr, 
 		unk0x10.processed_size = static_cast<u32>(input_addr + input_size - cutout_start_addr);
 		unk0x10.au_size = static_cast<u32>(input_addr + input_size - cutout_start_addr - 3);
 		unk0x10.remaining_bytes_to_parse = 3;
-		unk0x10.prev_bytes_size = old_cache_start_idx ? sizeof(v128) - old_cache_start_idx : 0;
-		std::memcpy(&unk0x10.prev_bytes, &access_unit.prev_packet_cache._bytes[old_cache_start_idx], sizeof(v128) - old_cache_start_idx);
+		unk0x10.prev_bytes_size = access_unit.cache_start_idx ? sizeof(v128) - access_unit.cache_start_idx : 0;
+		std::memcpy(&unk0x10.prev_bytes, &access_unit.prev_packet_cache._bytes[access_unit.cache_start_idx], sizeof(v128) - access_unit.cache_start_idx);
 
 		access_unit.size += unk0x10.prev_bytes_size + unk0x10.au_size;
 	}
@@ -501,11 +530,10 @@ void dmux_pamf_context::flush_es(u32 stream_id, u32 private_stream_id)
 		es.access_unit_queue.write(es.unk0x10);
 
 		const u32 au_size = es.access_unit.size - es.access_unit.cache_start_idx + 0x10;
-		const u32 au_start_offset = es.access_unit_queue.pos - au_size;
-
 		es.access_unit.size = au_size;
 
-		send_au_found(es.stream_id, es.private_stream_id, es.es_id, es.access_unit_queue.addr + au_start_offset, es.access_unit.pts, es.access_unit.dts, au_size, es.au_specific_info_size, es.access_unit.au_specific_info_buf, es.access_unit.is_rap);
+		event_queue_too_full = !send_event(DmuxPamfEventType::au_found, es.stream_id, es.private_stream_id, (es.access_unit_queue.addr + es.access_unit_queue.pos - au_size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(es.access_unit.pts)),
+			std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(es.access_unit.dts)), 0, au_size, es.au_specific_info_size, es.access_unit.au_specific_info_buf, es.es_id, es.access_unit.is_rap);
 	}
 
 	es.au_size = 0;
@@ -634,19 +662,19 @@ void dmux_pamf_context::discard_access_units()
 inline bool dmux_pamf_context::set_demux_done()
 {
 	demux_done = true;
-	au_queue_full = false;
-	return check_demux_done_was_notified();
+	return set_au_queue_full_and_check_demux_done<false>();
 }
 
 template <bool set_au_queue_full>
 inline bool dmux_pamf_context::set_au_queue_full_and_check_demux_done()
 {
 	au_queue_full = set_au_queue_full;
-	return demux_done ? check_demux_done_was_notified() : true;
-}
 
-inline bool dmux_pamf_context::check_demux_done_was_notified()
-{
+	if (!demux_done)
+	{
+		return true;
+	}
+
 	if (demux_done_was_notified)
 	{
 		return true;
@@ -696,21 +724,13 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		}
 		else
 		{
-			au_queue_full = false;
-			return check_demux_done_was_notified();
+			return set_au_queue_full_and_check_demux_done<false>();
 		}
 	}
-
-	s32 end_of_pack_stuffing_bytes_offset = 0;
 
 	switch (unk0x30.state)
 	{
 	case demuxer::state::initial:
-	{
-		unk0x30.state = demuxer::state::refreshing_buffer_and_finding_start_code;
-		[[fallthrough]];
-	}
-	case demuxer::state::refreshing_buffer_and_finding_start_code:
 	{
 		for (;;)
 		{
@@ -747,7 +767,6 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 
 			if (be_t<u32> code = read_from_ptr<be_t<u32>>(unk0x30.current_addr); code == PACK_START)
 			{
-				unk0x30.state = demuxer::state::parsing_pack_header;
 				break;
 			}
 			else if (code == PROG_END)
@@ -760,22 +779,18 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 					return set_au_queue_full_and_check_demux_done<false>();
 				}
 
-				unk0x30.state = demuxer::state::refreshing_buffer_and_finding_start_code;
+				unk0x30.state = demuxer::state::initial;
 
 				return set_au_queue_full_and_check_demux_done<false>();
 			}
 
-			cellDmuxPamf.warning("No start code found at the beginning of current segment");
+			cellDmuxPamf.warning("No start code found at the beginning of the current segment");
 		}
 
-		[[fallthrough]];
-	}
-	case demuxer::state::parsing_pack_header:
-	{
+// case demuxer::state::parsing_pack_header:
+
 		if (PACK_STUFFING_LENGTH_OFFSET > input_stream.bytes_to_process)
 		{
-			unk0x30.state = demuxer::state::parsing_pack_header;
-
 			input_stream.bytes_to_process = 0;
 
 			return set_demux_done();
@@ -783,17 +798,12 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 
 		const s32 pack_stuffing_length = read_from_ptr<u8>(unk0x30.current_addr + PACK_STUFFING_LENGTH_OFFSET) & 0x7;
 
-		end_of_pack_stuffing_bytes_offset = pack_stuffing_length + PACK_STUFFING_LENGTH_OFFSET + sizeof(u8);
+		const s32 end_of_pack_stuffing_bytes_offset = pack_stuffing_length + PACK_STUFFING_LENGTH_OFFSET + sizeof(u8);
 
-		unk0x30.state = demuxer::state::verifying_start_of_pes_packet;
-		[[fallthrough]];
-	}
-	case demuxer::state::verifying_start_of_pes_packet:
-	{
+// case demuxer::state::verifying_start_of_pes_packet:
+
 		if (end_of_pack_stuffing_bytes_offset > input_stream.bytes_to_process)
 		{
-			unk0x30.state = demuxer::state::verifying_start_of_pes_packet;
-
 			input_stream.bytes_to_process = 0;
 
 			return set_demux_done();
@@ -808,16 +818,13 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 
 		if (read_from_ptr<be_t<u32>>(unk0x30.current_addr) >> 8 != PACKET_START_CODE_PREFIX)
 		{
-			unk0x30.state = demuxer::state::refreshing_buffer_and_finding_start_code;
+			unk0x30.state = demuxer::state::initial;
 
 			return set_au_queue_full_and_check_demux_done<false>();
 		}
 
-		unk0x30.state = demuxer::state::parsing_system_header;
-		[[fallthrough]];
-	}
-	case demuxer::state::parsing_system_header:
-	{
+// case demuxer::state::parsing_system_header:
+
 		if (read_from_ptr<be_t<u32>>(unk0x30.current_addr) == SYSTEM_HEADER)
 		{
 			ensure(input_stream.bytes_to_process > 4 + static_cast<s32>(sizeof(u16))); // Not checked on LLE
@@ -836,7 +843,7 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 
 			if (be_t<u32> code = read_from_ptr<be_t<u32>>(input_addr_aligned); code >> 8 != PACKET_START_CODE_PREFIX)
 			{
-				unk0x30.state = demuxer::state::refreshing_buffer_and_finding_start_code;
+				unk0x30.state = demuxer::state::initial;
 
 				return set_au_queue_full_and_check_demux_done<false>();
 			}
@@ -858,16 +865,13 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 
 		if (read_from_ptr<be_t<u32>>(unk0x30.pes_packet_header) >> 8 != PACKET_START_CODE_PREFIX)
 		{
-			unk0x30.state = demuxer::state::refreshing_buffer_and_finding_start_code;
+			unk0x30.state = demuxer::state::initial;
 
 			return set_au_queue_full_and_check_demux_done<false>();
 		}
 
-		unk0x30.state = demuxer::state::parsing_pes_packet_header;
-		[[fallthrough]];
-	}
-	case demuxer::state::parsing_pes_packet_header:
-	{
+// case demuxer::state::parsing_pes_packet_header:
+
 		const u16 PES_packet_length = read_from_ptr<be_t<u16>>(&unk0x30.pes_packet_header[4]);
 		const u8 PES_header_data_length = unk0x30.pes_packet_header[8];
 
@@ -877,11 +881,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		unk0x30.pes_packet_remaining_size = total_pes_packet_length - total_pes_header_length;
 		unk0x30.current_addr += total_pes_header_length;
 
-		unk0x30.state = demuxer::state::parsing_elementary_stream_header;
-		[[fallthrough]];
-	}
-	case demuxer::state::parsing_elementary_stream_header:
-	{
+// case demuxer::state::parsing_elementary_stream_header:
+
 		const u32 PES_packet_start_code = read_from_ptr<be_t<u32>>(unk0x30.pes_packet_header);
 
 		const auto [type_idx, channel] = dmuxPamfStreamIdToTypeChannel(PES_packet_start_code, unk0x30.current_addr[0]);
@@ -997,28 +998,19 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 					es.access_unit_queue.write(es.unk0x10);
 				}
 
-				es._switch = 2;
-				[[fallthrough]];
-			}
-			case 2:
-			{
+		// case 2:
+
 				if (!es.au_timestamps_rap_set && es.access_unit.au_cut_status == 1)
 				{
 					es.set_au_timestamps_rap();
 				}
 
-				es._switch = 3;
-				[[fallthrough]];
-			}
-			case 3:
-			{
+		// case 3:
+
 				ensure(es.access_unit.au_cut_status != 2, "Gap between access units");
 
-				es._switch = 4;
-				[[fallthrough]];
-			}
-			case 4:
-			{
+		// case 4:
+
 				if (es.access_unit.au_cut_status == 3)
 				{
 					if (!es.au_timestamps_rap_set && es.unk0x10.prev_bytes_size == 0)
@@ -1036,9 +1028,10 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 			{
 				if (es.access_unit.au_cut_status == 3)
 				{
-					if (!send_au_found(es.stream_id, es.private_stream_id, es.es_id, es.access_unit_queue.addr + es.access_unit_queue.pos - es.access_unit.size, es.access_unit.pts, es.access_unit.dts,
-						es.access_unit.size, es.au_specific_info_size, es.access_unit.au_specific_info_buf, es.access_unit.is_rap))
+					if (!send_event(DmuxPamfEventType::au_found, es.stream_id, es.private_stream_id, (es.access_unit_queue.addr + es.access_unit_queue.pos - es.access_unit.size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(es.access_unit.pts)),
+						std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(es.access_unit.dts)), 0, es.access_unit.size, es.au_specific_info_size, es.access_unit.au_specific_info_buf, es.es_id, es.access_unit.is_rap))
 					{
+						event_queue_too_full = true;
 						return set_au_queue_full_and_check_demux_done<false>();
 					}
 				}
@@ -1059,11 +1052,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 					es.access_unit_queue.pos = 0;
 				}
 
-				es._switch = 6;
-				[[fallthrough]];
-			}
-			case 6:
-			{
+		// case 6:
+
 				if (es.parse_stream_result == 4)
 				{
 					es.reset();
@@ -1089,13 +1079,11 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 	{
 		if (!send_event(DmuxPamfEventType::prog_end_code))
 		{
-			unk0x30.state = demuxer::state::found_prog_end_code;
-
 			event_queue_too_full = true;
 			return set_au_queue_full_and_check_demux_done<false>();
 		}
 
-		unk0x30.state = demuxer::state::refreshing_buffer_and_finding_start_code;
+		unk0x30.state = demuxer::state::initial;
 
 		return set_au_queue_full_and_check_demux_done<false>();
 	}
@@ -1135,18 +1123,6 @@ bool dmux_pamf_context::get_next_cmd(DmuxPamfCommand& lhs, bool new_stream) cons
 	return true;
 }
 
-bool dmux_pamf_context::send_au_found(u8 stream_id, u8 private_stream_id, u32 es_id, vm::ptr<u8> au_addr, u64 pts, u64 dts, u32 au_size, u32 au_specific_info_size, const std::array<u8, 0x10>& au_specific_info_buf, bool is_rap)
-{
-	if (!send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, au_addr.addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(pts)),
-		std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(dts)), 0, au_size, au_specific_info_size, au_specific_info_buf, es_id, is_rap))
-	{
-		event_queue_too_full = true;
-		return false;
-	}
-
-	return true;
-}
-
 bool dmux_pamf_context::send_event(auto&&... args)
 {
 	if (event_queue->size() >= max_enqueued_events)
@@ -1154,7 +1130,7 @@ bool dmux_pamf_context::send_event(auto&&... args)
 		return false;
 	}
 
-	return ensure(event_queue->emplace(std::forward<decltype(args)>(args)..., +event_queue_was_too_full));
+	return ensure(event_queue->emplace(std::forward<decltype(args)>(args)..., event_queue_was_too_full));
 }
 
 void dmux_pamf_context::operator()() // cellSpursMain()
@@ -1175,7 +1151,7 @@ void dmux_pamf_context::operator()() // cellSpursMain()
 	{
 		if (get_next_cmd(cmd, new_stream))
 		{
-			event_queue_was_too_full = event_queue_too_full;
+			event_queue_was_too_full = event_queue_too_full; // TODO muss das sein
 			event_queue_too_full = false;
 
 			switch (cmd.type)
