@@ -91,7 +91,7 @@ enum class DmuxPamfCommandType : u32
 	enable_es = 0,
 	disable_es = 2,
 	set_stream = 4,
-	free_memory = 6,
+	release_au = 6,
 	flush_es = 8,
 	close = 10,
 	reset_stream = 12,
@@ -128,12 +128,12 @@ struct alignas(0x80) DmuxPamfCommand
 
 		struct
 		{
-			be_t<u64, 4> mem_addr;
-			be_t<u32> mem_size;
+			be_t<u64, 4> au_addr;
+			be_t<u32> au_size;
 			be_t<u32> stream_id;
 			be_t<u32> private_stream_id;
 		}
-		free_memory;
+		release_au;
 
 		struct
 		{
@@ -161,8 +161,8 @@ struct alignas(0x80) DmuxPamfCommand
 	{
 	}
 
-	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u64, 4>& mem_addr, const be_t<u32>& mem_size, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id)
-		: type(type), free_memory{ mem_addr, mem_size, stream_id, private_stream_id }
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u64, 4>& au_addr, const be_t<u32>& au_size, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id)
+		: type(type), release_au{ au_addr, au_size, stream_id, private_stream_id }
 	{
 	}
 
@@ -393,22 +393,16 @@ class dmux_pamf_context
 
 		u32 au_size = 0;
 
+		// enum class state : u8...
 		u32 _switch = 0; // TODO
 
-		struct es_0x10 // TODO
+		struct access_unit_fragment
 		{
-			std::span<const std::byte> stream;
-			u32 processed_size = 0;
-			std::vector<std::byte> cache;
-
-			void reset()
-			{
-				stream = {};
-				processed_size = 0;
-				cache.clear();
-			}
+			std::vector<std::byte> cached_data;
+			std::span<const std::byte> data;
+			u32 processed_size = 0; // TODO remove
 		}
-		unk0x10; // TODO
+		au_fragment;
 
 		struct access_unit_queue
 		{
@@ -419,15 +413,10 @@ class dmux_pamf_context
 			u32 end_pos = 0;
 
 			access_unit_queue(vm::ptr<std::byte> addr, u32 size) : addr(addr), size(size) {}
-			void append(const es_0x10& unk2);
-			void reset()
-			{
-				freed_mem_size = 0;
-				pos = 0;
-				end_pos = 0;
-			}
+			void append(const access_unit_fragment& au_fragment);
+			void reset() { freed_mem_size = pos = end_pos = 0; }
 		}
-		access_unit_queue;
+		au_queue;
 
 		struct access_unit
 		{
@@ -460,7 +449,7 @@ class dmux_pamf_context
 				info_offset = 0;
 			}
 		}
-		access_unit;
+		au;
 
 		virtual void parse_stream(std::span<const std::byte> input) = 0;
 		void reset()
@@ -477,9 +466,9 @@ class dmux_pamf_context
 
 		void set_au_timestamps_rap()
 		{
-			access_unit.pts = pts;
-			access_unit.dts = dts;
-			access_unit.rap = is_rap;
+			au.pts = pts;
+			au.dts = dts;
+			au.rap = is_rap;
 			is_rap = false;
 			reset_timestamps();
 			au_timestamps_rap_set = true;
@@ -508,42 +497,41 @@ class dmux_pamf_context
 			, es_id(es_id)
 			, au_max_size(au_max_size == umax || au_max_size > au_queue_buffer_size ? 0x800 : au_max_size)
 			, au_specific_info_size(au_specific_info_size)
-			, access_unit_queue(au_queue_buffer, au_queue_buffer_size)
+			, au_queue(au_queue_buffer, au_queue_buffer_size)
 		{
 		}
 
 		virtual ~elementary_stream() = default;
 		virtual u32 parse_private_stream_header(const u8* stream_header, const u8* pes_packet_header) = 0;
 		static bool is_enabled(const std::unique_ptr<elementary_stream>& es) { return !!es; }
-		void free_memory(u32 mem_size)
+		void release_au(u32 au_size)
 		{
-			if (access_unit_queue.end_pos != 0  && access_unit_queue.end_pos <= access_unit_queue.freed_mem_size + mem_size)
+			if (au_queue.end_pos != 0  && au_queue.end_pos <= au_queue.freed_mem_size + au_size)
 			{
-				ensure(access_unit_queue.end_pos == access_unit_queue.freed_mem_size + mem_size);
-				access_unit_queue.freed_mem_size = 0;
-				access_unit_queue.end_pos = 0;
+				ensure(au_queue.end_pos == au_queue.freed_mem_size + au_size);
+				au_queue.freed_mem_size = 0;
+				au_queue.end_pos = 0;
 				return;
 			}
 
-			access_unit_queue.freed_mem_size += mem_size;
+			au_queue.freed_mem_size += au_size;
 		}
 
 		void flush_es()
 		{
-			if (access_unit.size != 0)
+			if (au.size != 0)
 			{
-				ensure(!access_unit.cache.empty()); // If we're in the middle of cutting out an access unit, the last three bytes of the previous PES packet should always be in the cache
+				ensure(!au.cache.empty()); // If we're in the middle of cutting out an access unit, the last three bytes of the previous PES packet should always be in the cache
 
-				unk0x10.stream = {};
-				unk0x10.processed_size = 0;
-				unk0x10.cache = access_unit.cache;
+				au_fragment.data = {};
+				au_fragment.cached_data = au.cache;
 
-				access_unit_queue.append(unk0x10);
+				au_queue.append(au_fragment);
 
-				access_unit.size += access_unit.cache.size();
+				au.size += au.cache.size();
 
-				ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, (access_unit_queue.addr + access_unit_queue.pos - au_size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(access_unit.pts)),
-					std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(access_unit.dts)), 0, au_size, au_specific_info_size, access_unit.au_specific_info_buf, es_id, access_unit.rap);
+				ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, (au_queue.addr + au_queue.pos - au_size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.pts)),
+					std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.dts)), 0, au_size, au_specific_info_size, au.au_specific_info_buf, es_id, au.rap);
 			}
 
 			au_size = 0;
@@ -551,8 +539,8 @@ class dmux_pamf_context
 
 			reset();
 			reset_timestamps();
-			unk0x10.reset();
-			access_unit.reset();
+			au_fragment = {};
+			au.reset();
 
 			while (!ctx.send_event(DmuxPamfEventType::flush_done, stream_id, private_stream_id, es_id)){}
 		}
@@ -566,36 +554,35 @@ class dmux_pamf_context
 
 				reset();
 				reset_timestamps();
-				unk0x10.reset();
-				access_unit.reset();
-
-				access_unit_queue.reset();
+				au_fragment = {};
+				au.reset();
+				au_queue.reset();
 			}
 			else
 			{
-				const u32 au_offset = au_addr - access_unit_queue.addr;
+				const u32 au_offset = au_addr - au_queue.addr;
 
-				if (access_unit_queue.end_pos != 0 && au_offset > access_unit_queue.pos)
+				if (au_queue.end_pos != 0 && au_offset > au_queue.pos)
 				{
-					access_unit_queue.end_pos = 0;
+					au_queue.end_pos = 0;
 				}
 
-				access_unit_queue.pos = au_offset;
+				au_queue.pos = au_offset;
 			}
 		}
 
 		void discard_access_unit()
 		{
-			access_unit_queue.pos -= access_unit.size - (unk0x10.stream.size() + unk0x10.cache.size());
+			au_queue.pos -= au.size - (au_fragment.data.size() + au_fragment.cached_data.size());
 
 			au_size = 0;
 			au_timestamps_rap_set = false;
 
 			reset();
 			reset_timestamps();
-			unk0x10.reset();
-			access_unit.reset();
-			access_unit.cache.clear();
+			au_fragment = {};
+			au.reset();
+			au.cache.clear();
 		}
 	};
 
@@ -658,7 +645,7 @@ class dmux_pamf_context
 
 	void enable_es(u32 stream_id, u32 private_stream_id, bool is_avc, u32 au_queue_buffer_size, vm::ptr<std::byte> au_queue_buffer, u32 au_max_size, bool is_raw_es, u32 es_id);
 	void disable_es(u32 stream_id, u32 private_stream_id);
-	void free_memory(u32 mem_size, u32 stream_id, u32 private_stream_id) const;
+	void release_au(u32 au_size, u32 stream_id, u32 private_stream_id) const;
 	void flush_es(u32 stream_id, u32 private_stream_id);
 	void reset_stream();
 	void reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<std::byte> au_addr);
