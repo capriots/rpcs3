@@ -1,4 +1,5 @@
 #pragma once
+#include <queue>
 
 // Replacement for CellSpursQueue
 template <typename T, u32 max_num_of_entries> requires(std::is_trivial_v<T> && max_num_of_entries > 0)
@@ -109,7 +110,7 @@ struct alignas(0x80) DmuxPamfCommand
 			be_t<u32> stream_id;
 			be_t<u32> private_stream_id;
 			be_t<u32> is_avc;
-			vm::bptr<u8, u64> au_queue_buffer;
+			vm::bptr<std::byte, u64> au_queue_buffer;
 			be_t<u32> au_queue_buffer_size;
 			be_t<u32> au_max_size;
 			be_t<u32> au_specific_info_size;
@@ -165,7 +166,7 @@ struct alignas(0x80) DmuxPamfCommand
 	{
 	}
 
-	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id, const be_t<u32>& is_avc, const vm::bptr<u8, u64>& au_queue_buffer,
+	DmuxPamfCommand(be_t<DmuxPamfCommandType>&& type, const be_t<u32>& stream_id, const be_t<u32>& private_stream_id, const be_t<u32>& is_avc, const vm::bptr<std::byte, u64>& au_queue_buffer,
 		const be_t<u32>& au_queue_buffer_size, const be_t<u32>& au_max_size, const be_t<u32>& au_specific_info_size, const be_t<u32>& is_raw_es, const be_t<u32>& es_id)
 		: type(type), enable_es{ stream_id, private_stream_id, is_avc, au_queue_buffer, au_queue_buffer_size, au_max_size, au_specific_info_size, is_raw_es, es_id }
 	{
@@ -271,8 +272,9 @@ enum DmuxPamfStreamTypeIndex
 
 class dmux_pamf_context
 {
-	static constexpr u16 AC3_SYNCWORD = 0x0b77;
-	static constexpr u16 ATRACX_SYNCWORD = 0x0fd0;
+	static constexpr be_t<u16> AC3_SYNCWORD = 0x0b77;
+	static constexpr be_t<u16> ATRACX_SYNCWORD = 0x0fd0;
+	static constexpr u8 ATRACX_ATS_HEADER_SIZE = 8;
 	static constexpr u8 PACKET_START_CODE_PREFIX = 1;
 
 	static constexpr u16 AC3_FRMSIZE_TABLE[3][38] =
@@ -285,28 +287,19 @@ class dmux_pamf_context
 	static constexpr u16 PACK_SIZE = 0x800;
 	static constexpr s8 PACK_STUFFING_LENGTH_OFFSET = 0xd;
 
-
-	enum start_codes : u32
-	{
-		M2V_PIC_START       = 0x100,
-		AVC_AU_DELIMITER    = 0x109,
-		M2V_SEQUENCE_HEADER = 0x1b3,
-		M2V_SEQUENCE_END    = 0x1b7,
-		PACK_START          = 0x1ba,
-		SYSTEM_HEADER       = 0x1bb,
-		PRIVATE_STREAM_1    = 0x1bd,
-		PRIVATE_STREAM_2    = 0x1bf,
-		PROG_END            = 0x1b9,
-		VIDEO_STREAM_BASE   = 0x1e0, // The lower 4 bits indicate the channel
-	};
+	static constexpr be_t<u32> M2V_PIC_START       = 0x100;
+	static constexpr be_t<u32> AVC_AU_DELIMITER    = 0x109;
+	static constexpr be_t<u32> M2V_SEQUENCE_HEADER = 0x1b3;
+	static constexpr be_t<u32> M2V_SEQUENCE_END    = 0x1b7;
+	static constexpr be_t<u32> PACK_START          = 0x1ba;
+	static constexpr be_t<u32> SYSTEM_HEADER       = 0x1bb;
+	static constexpr be_t<u32> PRIVATE_STREAM_1    = 0x1bd;
+	static constexpr be_t<u32> PRIVATE_STREAM_2    = 0x1bf;
+	static constexpr be_t<u32> PROG_END            = 0x1b9;
+	static constexpr be_t<u32> VIDEO_STREAM_BASE   = 0x1e0; // The lower 4 bits indicate the channel
 
 
-	// These are globals on LLE
-
-	// We don't need these since we can read and write directly to PPU memory instead of DMA'ing like the LLE SPU thread does
-	// alignas(0x80) u8 input_buffer[0x4000];
-	// alignas(0x80) u8 output_buffer[0x4080];
-
+	// These are globals in the SPU task
 	const vm::ptr<dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>> cmd_queue;
 	const vm::ptr<dmux_pamf_hle_spurs_queue<be_t<u32>, 1>> cmd_result_queue;
 	const vm::ptr<dmux_pamf_hle_spurs_queue<DmuxPamfStreamInfo, 1>> stream_info_queue;
@@ -314,11 +307,11 @@ class dmux_pamf_context
 
 	bool au_queue_full = false;
 	bool event_queue_too_full = false;
-	bool event_queue_was_too_full = false; // TODO check if necessary
+	bool event_queue_was_too_full = false; // Sent to the PPU thread
 	u32 max_enqueued_events = 4; // 4 + 2 per enabled stream
 
 	bool get_next_cmd(DmuxPamfCommand& lhs, bool new_stream) const;
-	bool send_event(auto&&... args);
+	bool send_event(auto&&... args) const;
 
 	// This is a local variable in cellSpursMain(), needs to be saved for savestates
 	bool new_stream = false;
@@ -382,61 +375,51 @@ class dmux_pamf_context
 	}
 	unk0x30; // TODO
 
-	struct elementary_stream
+	class elementary_stream
 	{
+	public:
+		u64 pts = umax;
+		u64 dts = umax;
+		bool is_rap = false;
+
+	//protected: TODO
+		dmux_pamf_context& ctx;
 		const u8 stream_id;
 		const u8 private_stream_id;
 		const u32 es_id;
+		const u32 au_max_size;
+		const u32 au_specific_info_size;
+		bool au_timestamps_rap_set = false;
+
+		u32 au_size = 0;
 
 		u32 _switch = 0; // TODO
 
 		struct es_0x10 // TODO
 		{
-			const u8* addr = nullptr;
-			u32 au_size = 0;
+			std::span<const std::byte> stream;
 			u32 processed_size = 0;
-
-			u32 prev_bytes_size = 0;
-			v128 prev_bytes{};
-
-			s32 remaining_bytes_to_parse = 0;
+			std::vector<std::byte> cache;
 
 			void reset()
 			{
-				addr = nullptr;
-				au_size = 0;
+				stream = {};
 				processed_size = 0;
-				prev_bytes_size = 0;
-				prev_bytes = {};
-				remaining_bytes_to_parse = 0;
+				cache.clear();
 			}
 		}
 		unk0x10; // TODO
 
-		u32 parse_stream_result = 0;
-
-		u64 pts = umax;
-		u64 dts = umax;
-
-		bool is_rap = false;
-
-		const u32 au_specific_info_size;
-
 		struct access_unit_queue
 		{
-			const vm::ptr<u8> addr;
-
+			const vm::ptr<std::byte> addr;
+			const u32 size;
 			u32 freed_mem_size = 0;
 			u32 pos = 0;
 			u32 end_pos = 0;
 
-			const u32 size;
-			const u32 au_max_size;
-
-			access_unit_queue(vm::ptr<u8> addr, u32 size, u32 au_max_size) : addr(addr), size(size), au_max_size(au_max_size == umax || au_max_size > size ? 0x800 : au_max_size) {}
-
-			void write(const es_0x10& unk2);
-
+			access_unit_queue(vm::ptr<std::byte> addr, u32 size) : addr(addr), size(size) {}
+			void append(const es_0x10& unk2);
 			void reset()
 			{
 				freed_mem_size = 0;
@@ -448,42 +431,59 @@ class dmux_pamf_context
 
 		struct access_unit
 		{
-			u32 au_cut_status = 0; // 0 = not cutting out an au, 1 = started cutting, 2 = error (?), 3 = finished cutting, 5 = in the middle of cutting // TODO
-
+			// enum class state : u8...
+			u32 state = 0; // 0 = not cutting out an au, 1 = started cutting, 2 = error (?), 3 = finished cutting, 5 = in the middle of cutting // TODO
 			u32 size = 0;
+			u32 parsed_size = 0;
+			u32 info_offset = 0;
 
 			u64 pts = umax;
 			u64 dts = umax;
 
-			bool first_au_found = false; // TODO rename currently cutting out au
-
-			bool is_rap = false;
-
 			alignas(0x10) std::array<u8, 0x10> au_specific_info_buf{};
+			std::vector<std::byte> cache;
 
-			v128 prev_packet_cache{};
-			u32 cache_start_idx = 0;
-
-			u32 parsed_size = 0;
-			u32 au_info_offset = 0;
+			bool found_start_of_au = false; // TODO remove
+			bool rap = false;
 
 			void reset()
 			{
-				au_cut_status = 0;
-				first_au_found = false;
+				// cache isn't reset here
+				state = 0;
+				found_start_of_au = false;
 				size = 0;
-				is_rap = false;
+				rap = false;
 				pts = umax;
 				dts = umax;
 				au_specific_info_buf = {};
 				parsed_size = 0;
-				au_info_offset = 0;
+				info_offset = 0;
 			}
 		}
 		access_unit;
 
-		bool au_timestamps_rap_set = false;
-		u32 au_size = 0;
+		virtual void parse_stream(std::span<const std::byte> input) = 0;
+		void reset()
+		{
+			_switch = 0;
+			is_rap = false;
+		}
+
+		void reset_timestamps()
+		{
+			pts = umax;
+			dts = umax;
+		}
+
+		void set_au_timestamps_rap()
+		{
+			access_unit.pts = pts;
+			access_unit.dts = dts;
+			access_unit.rap = is_rap;
+			is_rap = false;
+			reset_timestamps();
+			au_timestamps_rap_set = true;
+		}
 
 		template <u32 unk_size_mask>
 		u32 parse_audio_stream_header(const u8* stream_header)
@@ -500,75 +500,143 @@ class dmux_pamf_context
 			return unk_size + 4;
 		}
 
-		elementary_stream(u32 stream_id, u32 private_stream_id, u32 es_id, u32 au_specific_info_size, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
-			: stream_id(stream_id), private_stream_id(private_stream_id), es_id(es_id), au_specific_info_size(au_specific_info_size), access_unit_queue(au_queue_buffer, au_queue_buffer_size, au_max_size)
+	public:
+		elementary_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, u32 au_specific_info_size, vm::ptr<std::byte> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
+			: ctx(ctx)
+			, stream_id(stream_id)
+			, private_stream_id(private_stream_id)
+			, es_id(es_id)
+			, au_max_size(au_max_size == umax || au_max_size > au_queue_buffer_size ? 0x800 : au_max_size)
+			, au_specific_info_size(au_specific_info_size)
+			, access_unit_queue(au_queue_buffer, au_queue_buffer_size)
 		{
 		}
 
 		virtual ~elementary_stream() = default;
-
-		void reset()
-		{
-			_switch = 0;
-			parse_stream_result = 0;
-			is_rap = false;
-		}
-
-		void reset_timestamps()
-		{
-			pts = umax;
-			dts = umax;
-		}
-
-		void set_au_timestamps_rap()
-		{
-			access_unit.pts = pts;
-			access_unit.dts = dts;
-			access_unit.is_rap = is_rap;
-			is_rap = false;
-			reset_timestamps();
-			au_timestamps_rap_set = true;
-		}
-
 		virtual u32 parse_private_stream_header(const u8* stream_header, const u8* pes_packet_header) = 0;
-		virtual u32 parse_stream(const u8* input_addr, u32 input_size) = 0;
+		static bool is_enabled(const std::unique_ptr<elementary_stream>& es) { return !!es; }
+		void free_memory(u32 mem_size)
+		{
+			if (access_unit_queue.end_pos != 0  && access_unit_queue.end_pos <= access_unit_queue.freed_mem_size + mem_size)
+			{
+				ensure(access_unit_queue.end_pos == access_unit_queue.freed_mem_size + mem_size);
+				access_unit_queue.freed_mem_size = 0;
+				access_unit_queue.end_pos = 0;
+				return;
+			}
+
+			access_unit_queue.freed_mem_size += mem_size;
+		}
+
+		void flush_es()
+		{
+			if (access_unit.size != 0)
+			{
+				ensure(!access_unit.cache.empty()); // If we're in the middle of cutting out an access unit, the last three bytes of the previous PES packet should always be in the cache
+
+				unk0x10.stream = {};
+				unk0x10.processed_size = 0;
+				unk0x10.cache = access_unit.cache;
+
+				access_unit_queue.append(unk0x10);
+
+				access_unit.size += access_unit.cache.size();
+
+				ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, (access_unit_queue.addr + access_unit_queue.pos - au_size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(access_unit.pts)),
+					std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(access_unit.dts)), 0, au_size, au_specific_info_size, access_unit.au_specific_info_buf, es_id, access_unit.rap);
+			}
+
+			au_size = 0;
+			au_timestamps_rap_set = false;
+
+			reset();
+			reset_timestamps();
+			unk0x10.reset();
+			access_unit.reset();
+
+			while (!ctx.send_event(DmuxPamfEventType::flush_done, stream_id, private_stream_id, es_id)){}
+		}
+
+		void reset_es(vm::ptr<std::byte> au_addr)
+		{
+			if (!au_addr)
+			{
+				au_size = 0;
+				au_timestamps_rap_set = false;
+
+				reset();
+				reset_timestamps();
+				unk0x10.reset();
+				access_unit.reset();
+
+				access_unit_queue.reset();
+			}
+			else
+			{
+				const u32 au_offset = au_addr - access_unit_queue.addr;
+
+				if (access_unit_queue.end_pos != 0 && au_offset > access_unit_queue.pos)
+				{
+					access_unit_queue.end_pos = 0;
+				}
+
+				access_unit_queue.pos = au_offset;
+			}
+		}
+
+		void discard_access_unit()
+		{
+			access_unit_queue.pos -= access_unit.size - (unk0x10.stream.size() + unk0x10.cache.size());
+
+			au_size = 0;
+			au_timestamps_rap_set = false;
+
+			reset();
+			reset_timestamps();
+			unk0x10.reset();
+			access_unit.reset();
+			access_unit.cache.clear();
+		}
 	};
 
 	template <bool is_avc>
 	struct video_stream : elementary_stream
 	{
-		video_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
+		video_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<std::byte> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
+			: elementary_stream(ctx, stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
+		void parse_stream(std::span<const std::byte> stream) override;
 		u32 parse_private_stream_header(const u8*, const u8*) override { return 0; } // Video streams aren't private streams
-		u32 parse_stream(const u8* input_addr, u32 input_size) override;
 	};
 
 	struct lpcm_stream : elementary_stream
 	{
 		alignas(0x10) std::array<u8, 0x10> au_specific_info_buf{};
 
-		lpcm_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 3, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
-
+		lpcm_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<std::byte> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
+			: elementary_stream(ctx, stream_id, private_stream_id, es_id, 3, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
+		void parse_stream(std::span<const std::byte> stream) override;
 		u32 parse_private_stream_header(const u8* stream_header, [[maybe_unused]] const u8* pes_packet_header) override
 		{
 			std::memcpy(au_specific_info_buf.data(), &stream_header[1], au_specific_info_buf.size());
 			return parse_audio_stream_header<0x7ff>(stream_header);
 		}
 
-		u32 parse_stream(const u8* input_addr, u32 input_size) override;
 	};
 
 	template <bool is_ac3>
 	struct audio_stream : elementary_stream
 	{
-		audio_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
+		audio_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<std::byte> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
+			: elementary_stream(ctx, stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
+		void parse_stream(std::span<const std::byte> stream) override;
 		u32 parse_private_stream_header(const u8* stream_header, [[maybe_unused]] const u8* pes_packet_header) override { return parse_audio_stream_header<0xffff>(stream_header); }
-		u32 parse_stream(const u8* input_addr, u32 input_size) override;
 	};
 
 	struct user_data_stream : elementary_stream
 	{
-		user_data_stream(u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<u8> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size) : elementary_stream(stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
-
+		user_data_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<std::byte> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
+			: elementary_stream(ctx, stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
+		void parse_stream(std::span<const std::byte> stream) override;
 		u32 parse_private_stream_header(const u8* stream_header, const u8* pes_packet_header) override
 		{
 			if (static_cast<s8>(pes_packet_header[7]) < 0) // PTS field exists
@@ -579,23 +647,21 @@ class dmux_pamf_context
 
 			return 2;
 		}
-
-		u32 parse_stream(const u8* input_addr, u32 input_size) override;
 	};
 
+	friend class elementary_stream;
 	std::unique_ptr<elementary_stream> elementary_streams[5][0x10]; // TODO description
 
 	bool raw_es = false; // Indicates that the input stream is a raw elementary stream instead of a multiplexed MPEG Program Stream. If set to true, MPEG-PS related parsing will be skipped
 	u32 es_type_idx = 0; // Indicates the type of the elementary stream if raw_es is true (this info is normally part of the MPEG-PS container)
 
 
-	void enable_es(u32 stream_id, u32 private_stream_id, bool is_avc, u32 au_queue_buffer_size, vm::ptr<u8> au_queue_buffer, u32 au_max_size, bool is_raw_es, u32 es_id);
+	void enable_es(u32 stream_id, u32 private_stream_id, bool is_avc, u32 au_queue_buffer_size, vm::ptr<std::byte> au_queue_buffer, u32 au_max_size, bool is_raw_es, u32 es_id);
 	void disable_es(u32 stream_id, u32 private_stream_id);
 	void free_memory(u32 mem_size, u32 stream_id, u32 private_stream_id) const;
 	void flush_es(u32 stream_id, u32 private_stream_id);
 	void reset_stream();
-	void reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<u8> au_addr);
-	void discard_access_units();
+	void reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<std::byte> au_addr);
 
 	bool demux(const DmuxPamfStreamInfo* stream_info);
 
@@ -998,7 +1064,7 @@ struct DmuxPamfElementaryStream
 	be_t<u16> private_stream_id;
 	b8 is_avc;
 
-	vm::bptr<u8> au_queue_buffer;
+	vm::bptr<std::byte> au_queue_buffer;
 	be_t<u32> unk; // Likely au_queue_buffer_size, unused
 	be_t<u32> au_max_size;
 	u8 au_specific_info[0x10];
