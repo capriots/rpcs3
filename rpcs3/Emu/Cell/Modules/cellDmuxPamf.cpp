@@ -71,95 +71,65 @@ void dmux_pamf_context::elementary_stream::access_unit_queue::append(const acces
 template <bool is_avc>
 void dmux_pamf_context::video_stream<is_avc>::parse_stream(std::span<const std::byte> stream)
 {
-	std::span<const std::byte>::iterator au_fragment_begin = {};
-
-	if (au.found_start_of_au)
+	if (au.state != 0 && (is_avc || au.state != 6))
 	{
-		cutout_start_addr = stream.data();
 		au.state = 5;
 	}
-	else if (!is_avc && au.state == 1)
-	{
-		cutout_start_addr = stream.data();
-	}
 
-	std::array<std::byte, 6> buf;
+	std::array<std::byte, 8> buf{};
 	std::ranges::copy(au.cache, buf.begin());
 	std::copy_n(stream.begin(), std::min<usz>(stream.size(), sizeof(u32) - 1), buf.begin() + au.cache.size());
 
+	auto au_fragment_begin = stream.begin();
 	s64 cache_idx = 0;
-	for (; cache_idx <= static_cast<s64>(au.cache.size() + std::min<usz>(stream.size(), sizeof(u32) - 1) - sizeof(u32)); cache_idx++)
-	{
-		if (const be_t<u32> code = read_from_ptr<be_t<u32>>(buf.data() + cache_idx); (is_avc && code == AVC_AU_DELIMITER) || (!is_avc && (code == M2V_PIC_START || code == M2V_SEQUENCE_HEADER || code == M2V_SEQUENCE_END)))
-		{
-			if (au.found_start_of_au)
-			{
-				au_fragment.data = { cutout_start_addr, !is_avc && code == M2V_SEQUENCE_END ? sizeof(u32) : 0 };
-				au_fragment.processed_size = !is_avc && code == M2V_SEQUENCE_END ? sizeof(u32) : 0;
-				std::copy_n(au.cache.begin(), cache_idx, std::back_inserter(au_fragment.cached_data));
-				au.cache.erase(au.cache.begin(), au.cache.begin() + cache_idx);
-
-				au.size += au_fragment.data.size() + au_fragment.cached_data.size();
-				au.state = 3;
-				return;
-			}
-
-			if (is_avc || !cutout_start_addr)
-			{
-				cutout_start_addr = stream.data();
-				au.state = 1;
-			}
-
-			au.found_start_of_au = is_avc || code == M2V_PIC_START;
-		}
-	}
-
 	auto stream_it = stream.begin();
-	for (; stream_it <= stream.end() - sizeof(u32); stream_it++)
+	[&]
 	{
-		if (const be_t<u32> code = read_from_ptr<be_t<u32>>(std::to_address(stream_it)); (is_avc && code == AVC_AU_DELIMITER) || (!is_avc && (code == M2V_PIC_START || code == M2V_SEQUENCE_HEADER || code == M2V_SEQUENCE_END)))
+		for (; cache_idx <= static_cast<s64>(au.cache.size() + std::min<usz>(stream.size(), sizeof(u32) - 1) - sizeof(u32)); cache_idx++)
 		{
-			if (au.found_start_of_au)
+			if (const be_t<u32> code = read_from_ptr<be_t<u32>>(buf.data() + cache_idx); (is_avc && code == AVC_AU_DELIMITER) || (!is_avc && (code == M2V_PIC_START || code == M2V_SEQUENCE_HEADER || code == M2V_SEQUENCE_END)))
 			{
-				if (!is_avc && code == M2V_SEQUENCE_END)
+				if (au.state != 0 && (is_avc || au.state != 6))
 				{
-					stream_it += sizeof(u32);
+					stream_it += !is_avc && code == M2V_SEQUENCE_END ? sizeof(u32) : 0;
+					au.state = 3;
+					return;
 				}
 
-				au_fragment.data = { cutout_start_addr, static_cast<usz>(std::to_address(stream_it) - cutout_start_addr) };
-				au_fragment.processed_size = au_fragment.data.size();
-				au_fragment.cached_data = std::move(au.cache);
-
-				au.size += au_fragment.data.size() + au_fragment.cached_data.size();
-				au.state = 3;
-				return;
+				au.state = is_avc || code == M2V_PIC_START ? 1 : 6;
 			}
-
-			if (is_avc || !cutout_start_addr)
-			{
-				cutout_start_addr = std::to_address(stream_it);
-				au.state = 1;
-			}
-
-			au.found_start_of_au = is_avc || code == M2V_PIC_START;
 		}
-	}
 
-	if (!cutout_start_addr)
+		for (; stream_it <= stream.end() - sizeof(u32); stream_it++)
+		{
+			if (const be_t<u32> code = read_from_ptr<be_t<u32>>(std::to_address(stream_it)); (is_avc && code == AVC_AU_DELIMITER) || (!is_avc && (code == M2V_PIC_START || code == M2V_SEQUENCE_HEADER || code == M2V_SEQUENCE_END)))
+			{
+				if (au.state != 0 && (is_avc || au.state != 6))
+				{
+					stream_it += !is_avc && code == M2V_SEQUENCE_END ? sizeof(u32) : 0;
+					au.state = 3;
+					return;
+				}
+
+				au_fragment_begin = is_avc || au.state == 0 ? stream_it : au_fragment_begin;
+				au.state = is_avc || code == M2V_PIC_START ? 1 : 6;
+			}
+		}
+	}();
+
+	au_fragment.data = { au_fragment_begin, stream_it };
+
+	if (au.state != 0)
 	{
-		au_fragment.data = {};
-	}
-	else
-	{
-		au_fragment.data = { cutout_start_addr, static_cast<usz>(std::to_address(stream_it) - cutout_start_addr) };
-		au_fragment.processed_size = static_cast<u32>(std::to_address(stream.end()) - cutout_start_addr);
+		au_fragment.processed_size = (au.state != 3 ? stream.end() : stream_it) - au_fragment_begin;
 		std::copy_n(au.cache.begin(), cache_idx, std::back_inserter(au_fragment.cached_data));
 		au.cache.erase(au.cache.begin(), au.cache.begin() + cache_idx);
-
-		au.size += au_fragment.data.size() + au_fragment.cached_data.size();
 	}
 
-	std::copy(stream_it, stream.end(), std::back_inserter(au.cache));
+	if (au.state != 3)
+	{
+		std::copy(stream_it, stream.end(), std::back_inserter(au.cache));
+	}
 }
 
 void dmux_pamf_context::lpcm_stream::parse_stream(std::span<const std::byte> stream)
@@ -175,24 +145,14 @@ void dmux_pamf_context::lpcm_stream::parse_stream(std::span<const std::byte> str
 	{
 		au_fragment.data = stream;
 		au_fragment.processed_size = stream.size();
-
-		au.size += stream.size();
-
-		if (au.state == 0)
-		{
-			au.state = 1; // TODO make enum
-			return ;
-		}
-
-		au.state = 5; // TODO make enum
-		return;
+		au.state = au.state == 0 ? 1 : 5; // TODO make enum
 	}
-
-	au_fragment.data = stream.first(remaining_au_bytes);
-	au_fragment.processed_size = remaining_au_bytes;
-
-	au.size += remaining_au_bytes;
-	au.state = 3; // TODO make enum
+	else
+	{
+		au_fragment.data = stream.first(remaining_au_bytes);
+		au_fragment.processed_size = remaining_au_bytes;
+		au.state = 3; // TODO make enum
+	}
 }
 
 template <bool is_ac3>
@@ -215,106 +175,83 @@ void dmux_pamf_context::audio_stream<is_ac3>::parse_stream(std::span<const std::
 		return 0;
 	};
 
-	const std::byte* cutout_start_addr = nullptr;
-
-	if (au.found_start_of_au)
+	if (au.state != 0)
 	{
-		cutout_start_addr = stream.data();
 		au.state = 5;
 	}
 
-	std::array<std::byte, 6> buf;
+	std::array<std::byte, 8> buf{};
 	std::ranges::copy(au.cache, buf.begin());
 	std::copy_n(stream.begin(), std::min<usz>(stream.size(), sizeof(u16) - 1), buf.begin() + au.cache.size());
 
+	auto au_fragment_begin = stream.begin();
 	s64 cache_idx = 0;
-	for (; cache_idx <= static_cast<s64>(au.cache.size() + std::min<usz>(stream.size(), sizeof(u16) - 1) - sizeof(u16)); cache_idx++)
-	{
-		if (const be_t<u16> tmp = read_from_ptr<be_t<u16>>(buf.data() + cache_idx); au.info_offset != 0)
-		{
-			if (--au.info_offset == 0)
-			{
-				au.parsed_size = parse_au_size(tmp);
-			}
-		}
-		else if ((is_ac3 && tmp == AC3_SYNCWORD) || (!is_ac3 && tmp == ATRACX_SYNCWORD))
-		{
-			if (!au.found_start_of_au)
-			{
-				cutout_start_addr = stream.data();
-
-				au.found_start_of_au = true;
-				au.info_offset = is_ac3 ? sizeof(u16) * 2 : sizeof(u16);
-				au.state = 1;
-				continue;
-			}
-
-			if (u32 current_au_size = au.size + cache_idx; current_au_size >= au.parsed_size)
-			{
-				au_fragment.data = { cutout_start_addr, 0 };
-				au_fragment.processed_size = 0;
-				std::copy_n(au.cache.begin(), cache_idx, std::back_inserter(au_fragment.cached_data));
-				au.cache.erase(au.cache.begin(), au.cache.begin() + cache_idx);
-
-				au.state = current_au_size == au.parsed_size ? 3 : 2;
-				au.size += au_fragment.cached_data.size();
-				return;
-			}
-		}
-	}
-
 	auto stream_it = stream.begin();
-	for (; stream_it <= stream.end() - sizeof(u32); stream_it++) // LLE uses sizeof(u32), even though we only read sizeof(u16) bytes
+	[&]
 	{
-		if (const be_t<u16> tmp = read_from_ptr<be_t<u16>>(std::to_address(stream_it)); au.info_offset != 0)
+		for (; cache_idx <= static_cast<s64>(au.cache.size() + std::min<usz>(stream.size(), sizeof(u16) - 1) - sizeof(u16)); cache_idx++)
 		{
-			if (--au.info_offset == 0)
+			if (const be_t<u16> tmp = read_from_ptr<be_t<u16>>(buf.data() + cache_idx); au.info_offset != 0)
 			{
-				au.parsed_size = parse_au_size(tmp);
+				if (--au.info_offset == 0)
+				{
+					au.parsed_size = parse_au_size(tmp);
+				}
+			}
+			else if ((is_ac3 && tmp == AC3_SYNCWORD) || (!is_ac3 && tmp == ATRACX_SYNCWORD))
+			{
+				if (au.state == 0)
+				{
+					au.info_offset = is_ac3 ? sizeof(u16) * 2 : sizeof(u16);
+					au.state = 1;
+				}
+				else if (u32 au_size = au.size + cache_idx; au_size >= au.parsed_size)
+				{
+					au.state = au_size == au.parsed_size ? 3 : 2;
+					return;
+				}
 			}
 		}
-		else if ((is_ac3 && tmp == AC3_SYNCWORD) || (!is_ac3 && tmp == ATRACX_SYNCWORD))
+
+		for (; stream_it <= stream.end() - sizeof(u32); stream_it++) // LLE uses sizeof(u32), even though we only read sizeof(u16) bytes
 		{
-			if (au.state == 0)
+			if (const be_t<u16> tmp = read_from_ptr<be_t<u16>>(std::to_address(stream_it)); au.info_offset != 0)
 			{
-				cutout_start_addr = std::to_address(stream_it);
-
-				au.found_start_of_au = true;
-				au.info_offset = is_ac3 ? sizeof(u16) * 2 : sizeof(u16);
-				au.state = 1;
-				continue;
+				if (--au.info_offset == 0)
+				{
+					au.parsed_size = parse_au_size(tmp);
+				}
 			}
-
-			const u32 processed_size = static_cast<u32>(std::to_address(stream_it) - cutout_start_addr);
-
-			if (u32 current_au_size = au.size + processed_size + au.cache.size(); current_au_size >= au.parsed_size)
+			else if ((is_ac3 && tmp == AC3_SYNCWORD) || (!is_ac3 && tmp == ATRACX_SYNCWORD))
 			{
-				au_fragment.data = { cutout_start_addr, processed_size };
-				au_fragment.processed_size = processed_size;
-				au_fragment.cached_data = std::move(au.cache);
-
-				au.state = current_au_size == au.parsed_size ? 3 : 2;
-				au.size += au_fragment.data.size() + au_fragment.cached_data.size();
-				return;
+				if (au.state == 0)
+				{
+					au_fragment_begin = stream_it;
+					au.info_offset = is_ac3 ? sizeof(u16) * 2 : sizeof(u16);
+					au.state = 1;
+				}
+				else if (u32 au_size = au.size + stream_it - au_fragment_begin + au.cache.size(); au_size >= au.parsed_size)
+				{
+					au.state = au_size == au.parsed_size ? 3 : 2;
+					return;
+				}
 			}
 		}
-	}
+	}();
 
-	if (!cutout_start_addr)
+	au_fragment.data = { au_fragment_begin, stream_it };
+
+	if (au.state != 0)
 	{
-		au_fragment.data = {};
-	}
-	else
-	{
-		au_fragment.data = { cutout_start_addr, static_cast<usz>(std::to_address(stream_it) - cutout_start_addr) };
-		au_fragment.processed_size = static_cast<u32>(std::to_address(stream.end()) - cutout_start_addr);
+		au_fragment.processed_size = (au.state != 3 ? stream.end() : stream_it) - au_fragment_begin;
 		std::copy_n(au.cache.begin(), cache_idx, std::back_inserter(au_fragment.cached_data));
 		au.cache.erase(au.cache.begin(), au.cache.begin() + cache_idx);
-
-		au.size += au_fragment.data.size() + au_fragment.cached_data.size();
 	}
 
-	std::copy(stream_it, stream.end(), std::back_inserter(au.cache));
+	if (au.state != 3)
+	{
+		std::copy(stream_it, stream.end(), std::back_inserter(au.cache));
+	}
 }
 
 void dmux_pamf_context::user_data_stream::parse_stream(std::span<const std::byte> stream)
@@ -324,22 +261,15 @@ void dmux_pamf_context::user_data_stream::parse_stream(std::span<const std::byte
 	if (au_size > stream.size())
 	{
 		au_fragment.data = stream;
-		au.size += stream.size();
 		au_size -= stream.size();
-
-		if (au.state == 0)
-		{
-			au.state = 1; // TODO make enum
-		}
-
-		return;
+		au.state = 1; // TODO make enum
 	}
-
-	au_fragment.data = stream.first(au_size);
-	au.size += au_size;
-	au_size = 0;
-
-	au.state = 3; // TODO make enum
+	else
+	{
+		au_fragment.data = stream.first(au_size);
+		au_size = 0;
+		au.state = 3; // TODO make enum
+	}
 }
 
 void dmux_pamf_context::enable_es(u32 stream_id, u32 private_stream_id, bool is_avc, u32 au_queue_buffer_size, vm::ptr<std::byte> au_queue_buffer, u32 au_max_size, bool is_raw_es, u32 es_id)
@@ -745,6 +675,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 
 				es.parse_stream({reinterpret_cast<const std::byte*>(unk0x30.current_addr), static_cast<usz>(unk0x30.pes_packet_remaining_size)}); // TODO remove cast
 
+				es.au.size += es.au_fragment.data.size() + es.au_fragment.cached_data.size();
+
 				es._switch = 1;
 				[[fallthrough]];
 			}
@@ -777,18 +709,12 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 					es.au_queue.append(es.au_fragment);
 				}
 
-		// case 2:
-
-				if (!es.au_timestamps_rap_set && es.au.state == 1)
+				if (!es.au_timestamps_rap_set && (es.au.state == 1 || es.au.state == 6))
 				{
 					es.set_au_timestamps_rap();
 				}
 
-		// case 3:
-
 				ensure(es.au.state != 2, "Invalid data between access units");
-
-		// case 4:
 
 				if (es.au.state == 3)
 				{

@@ -400,7 +400,7 @@ class dmux_pamf_context
 		{
 			std::vector<std::byte> cached_data;
 			std::span<const std::byte> data;
-			u32 processed_size = 0; // TODO remove
+			//u32 processed_size = 0; // TODO remove, AU CACHE SIZE!!!!!!!!!!!!!!
 		}
 		au_fragment;
 
@@ -428,18 +428,15 @@ class dmux_pamf_context
 
 			u64 pts = umax;
 			u64 dts = umax;
+			bool rap = false;
 
 			alignas(0x10) std::array<u8, 0x10> au_specific_info_buf{};
 			std::vector<std::byte> cache;
-
-			bool found_start_of_au = false; // TODO remove
-			bool rap = false;
 
 			void reset()
 			{
 				// cache isn't reset here
 				state = 0;
-				found_start_of_au = false;
 				size = 0;
 				rap = false;
 				pts = umax;
