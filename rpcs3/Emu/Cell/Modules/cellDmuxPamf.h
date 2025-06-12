@@ -1,5 +1,4 @@
 #pragma once
-#include <queue>
 
 // Replacement for CellSpursQueue
 template <typename T, u32 max_num_of_entries> requires(std::is_trivial_v<T> && max_num_of_entries > 0)
@@ -322,27 +321,17 @@ class dmux_pamf_context
 	u32 demux_done = true;
 	u32 demux_done_was_notified = true;
 
-	struct input_stream // TODO better stream implementation
+	// TODO
+	struct input_stream
 	{
+		const std::span<const std::byte> stream;
+		std::span<const std::byte>::iterator pos;
 		s32 bytes_to_process = 0; // TODO name
 
-		// We don't need this since we read the stream inplace instead of copying it like the LLE SPU thread does
-		// s32 buffer_remaining_size;
-		// u32 buffer_pos;
+		input_stream(const std::byte* addr, usz size) : stream(addr, size), pos(stream.begin()) {}
+	};
 
-		u32 pos = 0;
-		u32 size = 0;
-		vm::cptr<u8> addr = vm::null;
-
-		void init(vm::cptr<void, u64> addr, u32 size)
-		{
-			bytes_to_process = 0;
-			pos = 0;
-			this->size = size;
-			this->addr = vm::static_ptr_cast<const u8>(addr);
-		}
-	}
-	input_stream;
+	std::optional<input_stream> input_stream;
 
 	struct demuxer // TODO name
 	{
@@ -400,7 +389,7 @@ class dmux_pamf_context
 		{
 			std::vector<std::byte> cached_data;
 			std::span<const std::byte> data;
-			//u32 processed_size = 0; // TODO remove, AU CACHE SIZE!!!!!!!!!!!!!!
+			u32 processed_size = 0; // TODO remove, AU CACHE SIZE!!!!!!!!!!!!!!
 		}
 		au_fragment;
 
@@ -501,86 +490,10 @@ class dmux_pamf_context
 		virtual ~elementary_stream() = default;
 		virtual u32 parse_private_stream_header(const u8* stream_header, const u8* pes_packet_header) = 0;
 		static bool is_enabled(const std::unique_ptr<elementary_stream>& es) { return !!es; }
-		void release_au(u32 au_size)
-		{
-			if (au_queue.end_pos != 0  && au_queue.end_pos <= au_queue.freed_mem_size + au_size)
-			{
-				ensure(au_queue.end_pos == au_queue.freed_mem_size + au_size);
-				au_queue.freed_mem_size = 0;
-				au_queue.end_pos = 0;
-				return;
-			}
-
-			au_queue.freed_mem_size += au_size;
-		}
-
-		void flush_es()
-		{
-			if (au.size != 0)
-			{
-				ensure(!au.cache.empty()); // If we're in the middle of cutting out an access unit, the last three bytes of the previous PES packet should always be in the cache
-
-				au_fragment.data = {};
-				au_fragment.cached_data = au.cache;
-
-				au_queue.append(au_fragment);
-
-				au.size += au.cache.size();
-
-				ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, (au_queue.addr + au_queue.pos - au_size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.pts)),
-					std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.dts)), 0, au_size, au_specific_info_size, au.au_specific_info_buf, es_id, au.rap);
-			}
-
-			au_size = 0;
-			au_timestamps_rap_set = false;
-
-			reset();
-			reset_timestamps();
-			au_fragment = {};
-			au.reset();
-
-			while (!ctx.send_event(DmuxPamfEventType::flush_done, stream_id, private_stream_id, es_id)){}
-		}
-
-		void reset_es(vm::ptr<std::byte> au_addr)
-		{
-			if (!au_addr)
-			{
-				au_size = 0;
-				au_timestamps_rap_set = false;
-
-				reset();
-				reset_timestamps();
-				au_fragment = {};
-				au.reset();
-				au_queue.reset();
-			}
-			else
-			{
-				const u32 au_offset = au_addr - au_queue.addr;
-
-				if (au_queue.end_pos != 0 && au_offset > au_queue.pos)
-				{
-					au_queue.end_pos = 0;
-				}
-
-				au_queue.pos = au_offset;
-			}
-		}
-
-		void discard_access_unit()
-		{
-			au_queue.pos -= au.size - (au_fragment.data.size() + au_fragment.cached_data.size());
-
-			au_size = 0;
-			au_timestamps_rap_set = false;
-
-			reset();
-			reset_timestamps();
-			au_fragment = {};
-			au.reset();
-			au.cache.clear();
-		}
+		void release_au(u32 au_size);
+		void flush_es();
+		void reset_es(vm::ptr<std::byte> au_addr);
+		void discard_access_unit();
 	};
 
 	template <bool is_avc>
