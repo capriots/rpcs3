@@ -68,6 +68,86 @@ void dmux_pamf_context::elementary_stream::access_unit_queue::append(const acces
 	pos += au_fragment.data.size() + au_fragment.cached_data.size();
 }
 
+void dmux_pamf_context::elementary_stream::release_au(u32 au_size)
+{
+	au_queue.freed_mem_size += au_size;
+
+	if (au_queue.end_pos != 0 && au_queue.end_pos <= au_queue.freed_mem_size)
+	{
+		ensure(au_queue.end_pos == au_queue.freed_mem_size);
+		au_queue.freed_mem_size = 0;
+		au_queue.end_pos = 0;
+	}
+}
+
+void dmux_pamf_context::elementary_stream::flush_es()
+{
+	if (au.size != 0)
+	{
+		ensure(!au.cache.empty()); // If we're in the middle of cutting out an access unit, the last three bytes of the previous PES packet should always be in the cache
+
+		au_fragment.data = {};
+		au_fragment.cached_data = au.cache;
+
+		au_queue.append(au_fragment);
+
+		au.size += au.cache.size();
+
+		ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, (au_queue.addr + au_queue.pos - au_size).addr(), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.pts)),
+			std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.dts)), 0, au_size, au_specific_info_size, au.au_specific_info_buf, es_id, au.rap);
+	}
+
+	au_size = 0;
+	au_timestamps_rap_set = false;
+
+	reset();
+	reset_timestamps();
+	au_fragment = {};
+	au.reset();
+
+	while (!ctx.send_event(DmuxPamfEventType::flush_done, stream_id, private_stream_id, es_id)) {}
+}
+
+void dmux_pamf_context::elementary_stream::reset_es(vm::ptr<std::byte> au_addr)
+{
+	if (!au_addr)
+	{
+		au_size = 0;
+		au_timestamps_rap_set = false;
+
+		reset();
+		reset_timestamps();
+		au_fragment = {};
+		au.reset();
+		au_queue.reset();
+	}
+	else
+	{
+		const u32 au_offset = au_addr - au_queue.addr;
+
+		if (au_queue.end_pos != 0 && au_offset > au_queue.pos)
+		{
+			au_queue.end_pos = 0;
+		}
+
+		au_queue.pos = au_offset;
+	}
+}
+
+void dmux_pamf_context::elementary_stream::discard_access_unit()
+{
+	au_queue.pos -= au.size - (au_fragment.data.size() + au_fragment.cached_data.size());
+
+	au_size = 0;
+	au_timestamps_rap_set = false;
+
+	reset();
+	reset_timestamps();
+	au_fragment = {};
+	au.reset();
+	au.cache.clear();
+}
+
 template <bool is_avc>
 void dmux_pamf_context::video_stream<is_avc>::parse_stream(std::span<const std::byte> stream)
 {
@@ -117,7 +197,7 @@ void dmux_pamf_context::video_stream<is_avc>::parse_stream(std::span<const std::
 		}
 	}();
 
-	au_fragment.data = { au_fragment_begin, stream_it };
+	au_fragment.data = {au_fragment_begin, stream_it};
 
 	if (au.state != 0)
 	{
@@ -756,8 +836,6 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 					es.au_queue.end_pos = es.au_queue.pos;
 					es.au_queue.pos = 0;
 				}
-
-		// case 6:
 
 				if (es.au.state != 3)
 				{
