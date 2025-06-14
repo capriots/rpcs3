@@ -93,8 +93,8 @@ void dmux_pamf_context::elementary_stream::flush_es()
 
 		au.size += au.cache.size();
 
-		ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, vm::get_addr(au_queue.get_au_addr(au_size)), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.pts)),
-			std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.dts)), 0, au_size, au_specific_info_size, au.au_specific_info_buf, es_id, au.rap);
+		ctx.event_queue_too_full = !ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, vm::get_addr(au_queue.get_au_addr(au.size)), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.pts)),
+			std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.dts)), 0, au.size, au_specific_info_size, au.au_specific_info_buf, es_id, au.rap);
 	}
 
 	au_size = 0;
@@ -139,6 +139,119 @@ void dmux_pamf_context::elementary_stream::discard_access_unit()
 	au_fragment = {};
 	au.reset();
 	au.cache.clear();
+}
+
+bool dmux_pamf_context::elementary_stream::parse_stream()
+{
+	for (;;)
+	{
+		switch (state)
+		{
+		case state::initial:
+			if (au.state == 3) // TODO make enum
+			{
+				au_fragment = {};
+				au.reset();
+
+				if (stream.empty())
+				{
+					reset();
+					ctx.au_queue_full = false;
+					return true;
+				}
+			}
+
+			stream = stream.subspan(get_next_au_fragment(stream));
+
+			au.size += au_fragment.data.size() + au_fragment.cached_data.size();
+
+			state = state::appending_au_queue;
+			[[fallthrough]];
+
+		case state::appending_au_queue:
+			if (!au_fragment.data.empty() || !au_fragment.cached_data.empty())
+			{
+				if (!au_queue.is_wrapped())
+				{
+					if (!au_queue.check_size(au_fragment.data.size() + au_fragment.cached_data.size()))
+					{
+						cellDmuxPamf.error("Access unit fragment larger than specified maximum access unit size");
+						ctx.send_event(DmuxPamfEventType::fatal_error);
+						ctx.au_queue_full = true;
+						return false;
+					}
+				}
+				else
+				{
+					if (!au_queue.check_released_size(au_fragment.data.size() + au_fragment.cached_data.size() + 0x10)) // + sizeof(v128) because of SPU shenanigans probably
+					{
+						ctx.au_queue_full = true;
+						return false;
+					}
+				}
+
+				au_queue.append_au_fragment(au_fragment);
+			}
+
+			if (!au_timestamps_rap_set && (au.state == 1 || au.state == 6))
+			{
+				set_au_timestamps_rap();
+			}
+
+			ensure(au.state != 2, "Size mismatch between distance of sync words and au-size specified in stream");
+
+			if (au.state == 3)
+			{
+				if (!au_timestamps_rap_set && au_fragment.cached_data.empty())
+				{
+					set_au_timestamps_rap();
+				}
+
+				au_timestamps_rap_set = false;
+			}
+
+			state = state::notifying_au_found;
+			[[fallthrough]];
+
+		case state::notifying_au_found:
+			if (au.state == 3)
+			{
+				if (!ctx.send_event(DmuxPamfEventType::au_found, stream_id, private_stream_id, vm::get_addr(au_queue.get_au_addr(au.size)), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.pts)),
+					std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(au.dts)), 0, au.size, au_specific_info_size, au.au_specific_info_buf, es_id, au.rap))
+				{
+					ctx.event_queue_too_full = true;
+					ctx.au_queue_full = false;
+					return false;
+				}
+			}
+
+			state = state::waiting_for_au_released;
+			[[fallthrough]];
+
+		case state::waiting_for_au_released:
+			if (au.state == 3 && !au_queue.check_size(au_max_size))
+			{
+				if (au_queue.is_wrapped())
+				{
+					ctx.au_queue_full = true;
+					return false;
+				}
+
+				au_queue.wrap();
+			}
+
+			if (au.state != 3)
+			{
+				reset();
+				au_fragment = {};
+
+				ctx.au_queue_full = false;
+				return true;
+			}
+
+			state = state::initial;
+		}
+	}
 }
 
 template <bool is_avc>
@@ -442,14 +555,12 @@ void dmux_pamf_context::reset_es(u32 stream_id, u32 private_stream_id, vm::ptr<s
 inline bool dmux_pamf_context::set_demux_done()
 {
 	demux_done = true;
-	return set_au_queue_full_and_check_demux_done<false>();
+	au_queue_full = false;
+	return check_demux_done();
 }
 
-template <bool set_au_queue_full>
-inline bool dmux_pamf_context::set_au_queue_full_and_check_demux_done()
+inline bool dmux_pamf_context::check_demux_done()
 {
-	au_queue_full = set_au_queue_full;
-
 	if (!demux_done || demux_done_was_notified)
 	{
 		return true;
@@ -500,7 +611,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		}
 		else
 		{
-			return set_au_queue_full_and_check_demux_done<false>();
+			au_queue_full = false;
+			return check_demux_done();
 		}
 	}
 
@@ -528,7 +640,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 				}
 
 				state = state::elementary_stream;
-				return set_au_queue_full_and_check_demux_done<false>();
+				au_queue_full = false;
+				return check_demux_done();
 			}
 
 			// TODO kommentar von arbeit
@@ -546,11 +659,13 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 				{
 					state = state::prog_end;
 					event_queue_too_full = true;
-					return set_au_queue_full_and_check_demux_done<false>();
+					au_queue_full = false;
+					return check_demux_done();
 				}
 
 				state = state::initial;
-				return set_au_queue_full_and_check_demux_done<false>();
+				au_queue_full = false;
+				return check_demux_done();
 			}
 
 			cellDmuxPamf.warning("No start code found at the beginning of the current segment");
@@ -567,7 +682,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		if (read_from_ptr<be_t<u32>>(pes_packet.begin()) >> 8 != PACKET_START_CODE_PREFIX)
 		{
 			state = state::initial;
-			return set_au_queue_full_and_check_demux_done<false>();
+			au_queue_full = false;
+			return check_demux_done();
 		}
 
 // case demuxer::state::parsing_system_header:
@@ -588,7 +704,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 			if (const be_t<u32> code = read_from_ptr<be_t<u32>>(pes_packet.begin()); code >> 8 != PACKET_START_CODE_PREFIX)
 			{
 				state = state::initial;
-				return set_au_queue_full_and_check_demux_done<false>();
+				au_queue_full = false;
+				return check_demux_done();
 			}
 			else if (code == PRIVATE_STREAM_2)
 			{
@@ -610,7 +727,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		if (pes_packet_start_code >> 8 != PACKET_START_CODE_PREFIX)
 		{
 			state = state::initial;
-			return set_au_queue_full_and_check_demux_done<false>();
+			au_queue_full = false;
+			return check_demux_done();
 		}
 
 // case demuxer::state::parsing_pes_packet_header:
@@ -630,7 +748,8 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		if (type_idx == DMUX_PAMF_STREAM_TYPE_INDEX_INVALID)
 		{
 			state = state::initial;
-			return set_au_queue_full_and_check_demux_done<false>();
+			au_queue_full = false;
+			return check_demux_done();
 		}
 
 		pack.type_idx = type_idx;
@@ -671,135 +790,29 @@ bool dmux_pamf_context::demux(const DmuxPamfStreamInfo* stream_info)
 		if (!elementary_stream::is_enabled(elementary_streams[pack.type_idx][pack.channel]))
 		{
 			state = state::initial;
-			return set_au_queue_full_and_check_demux_done<false>();
+			au_queue_full = false;
+			return check_demux_done();
 		}
 
-		elementary_stream& es = *elementary_streams[pack.type_idx][pack.channel];
-
-		for (;;)
+		if (elementary_streams[pack.type_idx][pack.channel]->parse_stream())
 		{
-			switch (es.state)
-			{
-			case elementary_stream::state::initial:
-			{
-				if (es.au.state == 3) // TODO make enum
-				{
-					es.au_fragment = {};
-					es.au.reset();
-
-					if (es.stream.empty())
-					{
-						es.reset();
-						state = state::initial;
-						return set_au_queue_full_and_check_demux_done<false>();
-					}
-				}
-
-				es.stream = es.stream.subspan(es.get_next_au_fragment(es.stream));
-
-				es.au.size += es.au_fragment.data.size() + es.au_fragment.cached_data.size();
-
-				es.state = elementary_stream::state::appending_au_queue;
-				[[fallthrough]];
-			}
-			case elementary_stream::state::appending_au_queue:
-			{
-				if (!es.au_fragment.data.empty() || !es.au_fragment.cached_data.empty())
-				{
-					if (!es.au_queue.is_wrapped())
-					{
-						if (!es.au_queue.check_size(es.au_fragment.data.size() + es.au_fragment.cached_data.size()))
-						{
-							cellDmuxPamf.error("Access unit fragment larger than specified maximum access unit size");
-							send_event(DmuxPamfEventType::fatal_error);
-							return set_au_queue_full_and_check_demux_done<true>();
-						}
-					}
-					else
-					{
-						if (!es.au_queue.check_released_size(es.au_fragment.data.size() + es.au_fragment.cached_data.size() + 0x10)) // + sizeof(v128) because of SPU shenanigans probably
-						{
-							return set_au_queue_full_and_check_demux_done<true>();
-						}
-					}
-
-					es.au_queue.append_au_fragment(es.au_fragment);
-				}
-
-				if (!es.au_timestamps_rap_set && (es.au.state == 1 || es.au.state == 6))
-				{
-					es.set_au_timestamps_rap();
-				}
-
-				ensure(es.au.state != 2, "Size mismatch between distance of sync words and au-size specified in stream");
-
-				if (es.au.state == 3)
-				{
-					if (!es.au_timestamps_rap_set && es.au_fragment.cached_data.empty())
-					{
-						es.set_au_timestamps_rap();
-					}
-
-					es.au_timestamps_rap_set = false;
-				}
-
-				es.state = elementary_stream::state::notifying_au_found;
-				[[fallthrough]];
-			}
-			case elementary_stream::state::notifying_au_found:
-			{
-				if (es.au.state == 3)
-				{
-					if (!send_event(DmuxPamfEventType::au_found, es.stream_id, es.private_stream_id, vm::get_addr(es.au_queue.get_au_addr(es.au.size)), std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(es.au.pts)),
-						std::bit_cast<CellCodecTimeStamp>(static_cast<be_t<u64>>(es.au.dts)), 0, es.au.size, es.au_specific_info_size, es.au.au_specific_info_buf, es.es_id, es.au.rap))
-					{
-						event_queue_too_full = true;
-						return set_au_queue_full_and_check_demux_done<false>();
-					}
-				}
-
-				es.state = elementary_stream::state::waiting_for_au_released;
-				[[fallthrough]];
-			}
-			case elementary_stream::state::waiting_for_au_released:
-			{
-				if (es.au.state == 3 && !es.au_queue.check_size(es.au_max_size))
-				{
-					if (es.au_queue.is_wrapped())
-					{
-						return set_au_queue_full_and_check_demux_done<true>();
-					}
-
-					es.au_queue.wrap();
-				}
-
-				if (es.au.state != 3)
-				{
-					es.reset();
-					es.au_fragment = {};
-
-					state = state::initial;
-					return set_au_queue_full_and_check_demux_done<false>();
-				}
-
-				es.state = elementary_stream::state::initial;
-				continue;
-			}
-			default:
-				return set_au_queue_full_and_check_demux_done<true>();
-			}
+			state = state::initial;
 		}
+
+		return check_demux_done();
 	}
 	case state::prog_end:
 	{
 		if (!send_event(DmuxPamfEventType::prog_end_code))
 		{
 			event_queue_too_full = true;
-			return set_au_queue_full_and_check_demux_done<false>();
+			au_queue_full = false;
+			return check_demux_done();
 		}
 
 		state = state::initial;
-		return set_au_queue_full_and_check_demux_done<false>();
+		au_queue_full = false;
+		return check_demux_done();
 	}
 	default:
 		fmt::throw_exception("Unreachable");
@@ -1919,7 +1932,6 @@ error_code DmuxPamfContext::close(ppu_thread& ppu)
 	}
 
 	ensure(idm::remove<dmux_pamf_thread>(hle_spu_thread_id));
-	//stop_spu_thread();
 
 	return CELL_OK;
 }

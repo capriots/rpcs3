@@ -368,7 +368,7 @@ class dmux_pamf_context
 
 		std::span<const std::byte> stream;
 		bool au_timestamps_rap_set = false;
-		u32 au_size = 0;
+		u32 au_size = 0; // TODO rename this shit
 
 		enum class state : u8
 		{
@@ -499,6 +499,7 @@ class dmux_pamf_context
 
 		virtual ~elementary_stream() = default;
 		virtual usz parse_stream_header(const std::span<const std::byte>& elementary_stream, s8 pts_dts_flag) = 0;
+		bool parse_stream();
 		static bool is_enabled(const std::unique_ptr<elementary_stream>& es) { return !!es; }
 		void set_rap() { is_rap = true; }
 		void set_pts(u64 pts) { this->pts = pts; }
@@ -516,7 +517,7 @@ class dmux_pamf_context
 		video_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, vm::ptr<std::byte> au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
 			: elementary_stream(ctx, stream_id, private_stream_id, es_id, 0, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
 		usz get_next_au_fragment(const std::span<const std::byte>& stream) override;
-		usz parse_stream_header(const std::span<const std::byte>& elementary_stream, [[maybe_unused]] s8 pts_dts_flag) override { return 0; }
+		usz parse_stream_header([[maybe_unused]] const std::span<const std::byte>& elementary_stream, [[maybe_unused]] s8 pts_dts_flag) override { return 0; }
 	};
 
 	struct lpcm_stream : elementary_stream
@@ -580,13 +581,12 @@ class dmux_pamf_context
 
 	// These are labels in the LLE demux function. LLE jumps to these before returning from that function
 	inline bool set_demux_done();
-	template <bool set_au_queue_full>
-	inline bool set_au_queue_full_and_check_demux_done();
+	inline bool check_demux_done();
 
 public:
-	static constexpr u32 id_base = 0xf0000000;
-	static constexpr u32 id_step = 0x00000100;
-	static constexpr u32 id_count = 1024;
+	static constexpr u32 id_base = 0;
+	static constexpr u32 id_step = 1;
+	static constexpr u32 id_count = 0x400;
 	SAVESTATE_INIT_POS(std::numeric_limits<double>::max()); // Doesn't depend on or is a dependency of anything
 
 	dmux_pamf_context(vm::ptr<dmux_pamf_hle_spurs_queue<DmuxPamfCommand, 1>> cmd_queue, vm::ptr<dmux_pamf_hle_spurs_queue<be_t<u32>, 1>> cmd_result_queue,
