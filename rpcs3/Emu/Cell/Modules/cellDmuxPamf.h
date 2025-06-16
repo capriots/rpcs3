@@ -330,7 +330,13 @@ class dmux_pamf_context
 	public:
 		input_stream(vm::cptr<std::byte> addr, usz size) : stream(addr.get_ptr(), size), pos(stream.begin()) { ensure(!(size & 0x7ff)); } // TODO kommentar von arbeit
 		bool eof() const { return pos == stream.end(); }
-		std::span<const std::byte, PACK_SIZE> get_next_pack() { ensure(!eof()); const std::span<const std::byte, PACK_SIZE> ret{ pos, PACK_SIZE }; pos += PACK_SIZE; return ret; }
+		std::span<const std::byte, PACK_SIZE> get_next_pack()
+		{
+			ensure(!eof());
+			const std::span<const std::byte, PACK_SIZE> ret{ pos, PACK_SIZE };
+			pos += PACK_SIZE;
+			return ret;
+		}
 	};
 
 	std::optional<input_stream> input_stream;
@@ -346,28 +352,25 @@ class dmux_pamf_context
 	struct pack
 	{
 		std::span<const std::byte> stream;
-		u32 type_idx = 0; // Type of the elementary stream in the current pes packet
-		u32 channel = 0;  // Channel of the elementary stream in the current pes packet
+		u32 type_idx = 0; // Type of the elementary stream in the current pack
+		u32 channel = 0;  // Channel of the elementary stream in the current pack
 	}
 	pack;
 
 	class elementary_stream
 	{
-	public:
+		dmux_pamf_context& ctx;
+		std::span<const std::byte> stream;
+		const u8 stream_id;
+		const u8 private_stream_id;
+		const u32 es_id;
+		const u32 au_specific_info_size;
 		u64 pts = umax;
 		u64 dts = umax;
 		bool is_rap = false;
 
-	//protected: TODO
-		dmux_pamf_context& ctx;
-		const u8 stream_id;
-		const u8 private_stream_id;
-		const u32 es_id;
+	protected:
 		const u32 au_max_size;
-		const u32 au_specific_info_size;
-
-		std::span<const std::byte> stream;
-		bool au_timestamps_rap_set = false;
 		u32 au_size = 0; // TODO rename this shit
 
 		enum class state : u8
@@ -418,45 +421,54 @@ class dmux_pamf_context
 
 		struct access_unit
 		{
-			// enum class state : u8...
-			u32 state = 0; // 0 = not cutting out an au, 1 = started cutting, 2 = error (?), 3 = finished cutting, 5 = in the middle of cutting // TODO
+			enum class state : u8
+			{
+				none,          // An access unit is not currently being cut out
+				active,        // An access unit is currently being cut out
+				commenced,     // The current PES-packet contains the beginning of an access unit
+				complete,      // The current PES-packet contains the end of an access unit (takes precedence over "commenced" if both are true for the same PES-packet)
+				size_mismatch, // The distance between sync words and size indicated in the access unit's info header does not match
+				m2v_sequence,  // Special case for M2V, access unit commenced, but the next start code does not complete the access unit
+			}
+			state = state::none;
+
+			bool rap = false;
+			bool timestamps_rap_set = false;
+
 			u32 size = 0;
+
 			u32 parsed_size = 0;
 			u32 info_offset = 0;
 
 			u64 pts = umax;
 			u64 dts = umax;
-			bool rap = false;
 
 			alignas(0x10) std::array<u8, 0x10> au_specific_info_buf{};
-			std::vector<std::byte> cache;
+			std::vector<std::byte> cache; // TODO move one level up
 
 			void reset()
 			{
 				// cache isn't reset here
-				state = 0;
-				size = 0;
+				state = state::none;
 				rap = false;
+				timestamps_rap_set = false;
+				size = 0;
 				pts = umax;
 				dts = umax;
-				au_specific_info_buf = {};
 				parsed_size = 0;
 				info_offset = 0;
+				au_specific_info_buf = {};
 			}
 		}
 		au;
 
 		virtual usz get_next_au_fragment(const std::span<const std::byte>& stream) = 0;
-		void reset()
-		{
-			state = state::initial;
-			is_rap = false;
-		}
 
-		void reset_timestamps()
+		void reset_timestamps_rap()
 		{
 			pts = umax;
 			dts = umax;
+			is_rap = false;
 		}
 
 		void set_au_timestamps_rap()
@@ -464,9 +476,8 @@ class dmux_pamf_context
 			au.pts = pts;
 			au.dts = dts;
 			au.rap = is_rap;
-			is_rap = false;
-			reset_timestamps();
-			au_timestamps_rap_set = true;
+			reset_timestamps_rap();
+			au.timestamps_rap_set = true;
 		}
 
 		template <u32 unk_size_mask>
@@ -476,8 +487,8 @@ class dmux_pamf_context
 
 			if (au_size == 0)
 			{
-				ensure(elementary_stream.size() >= 1 + sizeof(u32));
-				unk_size = read_from_ptr<be_t<u32>>(elementary_stream.begin() + 1) >> 8 & unk_size_mask;
+				ensure(elementary_stream.size() >= sizeof(u32));
+				unk_size = read_from_ptr<be_t<u32>>(elementary_stream) & unk_size_mask;
 				ensure(unk_size != unk_size_mask); // This case is bugged on LLE, likely never happens with valid streams
 				au_size = 1;
 			}
@@ -491,8 +502,8 @@ class dmux_pamf_context
 			, stream_id(stream_id)
 			, private_stream_id(private_stream_id)
 			, es_id(es_id)
-			, au_max_size(au_max_size == umax || au_max_size > au_queue_buffer_size ? 0x800 : au_max_size)
 			, au_specific_info_size(au_specific_info_size)
+			, au_max_size(au_max_size == umax || au_max_size > au_queue_buffer_size ? 0x800 : au_max_size)
 			, au_queue(au_queue_buffer, au_queue_buffer_size)
 		{
 		}
@@ -580,7 +591,7 @@ class dmux_pamf_context
 	bool demux(const DmuxPamfStreamInfo* stream_info);
 
 	// These are labels in the LLE demux function. LLE jumps to these before returning from that function
-	inline bool set_demux_done();
+	inline bool reset_state_and_check_demux_done();
 	inline bool check_demux_done();
 
 public:
