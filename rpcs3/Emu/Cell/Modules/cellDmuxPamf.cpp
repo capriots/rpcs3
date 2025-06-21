@@ -9,6 +9,8 @@
 #include "sysPrxForUser.h"
 #include "util/asm.hpp"
 
+#include <bitset>
+#include <ranges>
 #include "cellDmux.h"
 #include "cellDmuxPamf.h"
 
@@ -482,7 +484,7 @@ u32 dmux_pamf_context::user_data_stream::parse_stream(const std::span<const std:
 	return stream.size();
 }
 
-void dmux_pamf_context::demuxer::enable_es(u32 stream_id, u32 private_stream_id, bool is_avc, u32 au_queue_buffer_size, std::byte* au_queue_buffer, u32 au_max_size, bool is_raw_es, u32 es_id)
+void dmux_pamf_context::demuxer::enable_es(u32 stream_id, u32 private_stream_id, bool is_avc, u32 au_queue_buffer_size, std::byte* au_queue_buffer, u32 au_max_size, bool raw_es, u32 es_id)
 {
 	const auto [type_idx, channel] = dmuxPamfStreamIdToTypeChannel(stream_id, private_stream_id);
 
@@ -491,7 +493,7 @@ void dmux_pamf_context::demuxer::enable_es(u32 stream_id, u32 private_stream_id,
 		return;
 	}
 
-	raw_es = is_raw_es;
+	this->raw_es = raw_es;
 	es_type_idx = type_idx;
 
 	switch (type_idx)
@@ -548,7 +550,7 @@ void dmux_pamf_context::demuxer::flush_es(u32 stream_id, u32 private_stream_id)
 
 void dmux_pamf_context::demuxer::reset_stream()
 {
-	std::for_each(&elementary_streams[0][0], &elementary_streams[std::size(elementary_streams)][0], [](const auto& es){ if (elementary_stream::is_enabled(es)) es->discard_access_unit(); });
+	std::ranges::for_each(elementary_streams | std::views::join | std::views::filter(elementary_stream::is_enabled), &elementary_stream::discard_access_unit);
 	state = state::initial;
 	input_stream = {};
 }
@@ -617,7 +619,7 @@ bool dmux_pamf_context::demuxer::demux(const DmuxPamfStreamInfo* stream_info)
 
 			if (!stream_info->continuity)
 			{
-				std::for_each(&elementary_streams[0][0], &elementary_streams[std::size(elementary_streams)][0], [](const auto& es){ if (elementary_stream::is_enabled(es)) es->discard_access_unit(); });
+				std::ranges::for_each(elementary_streams | std::views::join | std::views::filter(elementary_stream::is_enabled), &elementary_stream::discard_access_unit );
 			}
 
 			state = state::initial;
@@ -982,6 +984,102 @@ void dmux_pamf_context::operator()() // cellSpursMain()
 	}
 }
 
+void dmux_pamf_context::elementary_stream::save(utils::serial& ar)
+{
+	ar(state, es_id, vm::get_addr(current_stream_chunk.data()), static_cast<u32>(current_stream_chunk.size()), pts, dts, rap, vm::get_addr(au_queue.buffer.data()), static_cast<u32>(au_queue.buffer.size()),
+		vm::get_addr(std::to_address(au_queue.back)), vm::get_addr(std::to_address(au_queue.front)), vm::get_addr(std::to_address(au_queue.wrap_pos)), au_max_size, au_size_unk, current_au);
+
+	if (state == state::pushing_au_queue)
+	{
+		ar(au_chunk.cached_data, vm::get_addr(au_chunk.data.data()), static_cast<u32>(au_chunk.data.size()));
+	}
+
+	if (current_au.state != access_unit::state::complete)
+	{
+		ar(cache);
+	}
+}
+
+void dmux_pamf_context::demuxer::save(utils::serial& ar)
+{
+	ar(state, demux_done, demux_done_was_notified, raw_es, es_type_idx);
+
+	if (!demux_done)
+	{
+		input_stream.save(ar);
+	}
+
+	if (state == state::elementary_stream)
+	{
+		if (ar.is_writing())
+		{
+			ar(vm::get_addr(current_pack.stream.data()), current_pack.es_type_idx, current_pack.es_channel);
+		}
+		else
+		{
+			current_pack.stream = { vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), 0x800 };
+			ar(current_pack.es_type_idx, current_pack.es_channel);
+		}
+	}
+
+	std::array<bool, 0x10> video_streams_bitset;
+	std::array<bool, 0x10> video_streams_avc_bitset;
+	std::array<bool, 0x10> lpcm_streams_bitset;
+	std::array<bool, 0x10> ac3_streams_bitset;
+	std::array<bool, 0x10> atracx_streams_bitset;
+	std::array<bool, 0x10> user_data_streams_bitset;
+
+	if (ar.is_writing())
+	{
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO], video_streams_bitset.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO], video_streams_avc_bitset.begin(), [](const auto& es){ return !dynamic_cast<video_stream<false>*>(es.get()); });
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_LPCM], lpcm_streams_bitset.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_AC3], ac3_streams_bitset.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX], atracx_streams_bitset.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA], user_data_streams_bitset.begin(), elementary_stream::is_enabled);
+	}
+
+	ar(video_streams_bitset, video_streams_avc_bitset, lpcm_streams_bitset, ac3_streams_bitset, atracx_streams_bitset, user_data_streams_bitset);
+
+	if (ar.is_writing())
+	{
+		std::ranges::for_each(elementary_streams | std::views::join | std::views::filter(elementary_stream::is_enabled), [&ar](const auto& es){ es->save(ar); });
+	}
+	else
+	{
+		for (u32 ch = 0; ch < 0x10; ch++)
+			if (video_streams_bitset[ch])
+				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO][ch] = video_streams_avc_bitset[ch]
+					? static_cast<std::unique_ptr<elementary_stream>>(std::make_unique<video_stream<true>>(ctx, ar, 0xe0 | ch))
+					: std::make_unique<video_stream<false>>(ctx, ar, 0xe0 | ch);
+
+		for (u32 ch = 0; ch < 0x10; ch++)
+			if (lpcm_streams_bitset[ch])
+				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_LPCM][ch] = std::make_unique<lpcm_stream>(ctx, ar, 0x40 | ch);
+
+		for (u32 ch = 0; ch < 0x10; ch++)
+			if (ac3_streams_bitset[ch])
+				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_AC3][ch] = std::make_unique<audio_stream<true>>(ctx, ar, 0x30 | ch);
+
+		for (u32 ch = 0; ch < 0x10; ch++)
+			if (atracx_streams_bitset[ch])
+				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX][ch] = std::make_unique<audio_stream<false>>(ctx, ar, 0x00 | ch);
+
+		for (u32 ch = 0; ch < 0x10; ch++)
+			if (user_data_streams_bitset[ch])
+				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA][ch] = std::make_unique<user_data_stream>(ctx, ar, 0x20 | ch);
+	}
+}
+
+void dmux_pamf_context::save(utils::serial& ar)
+{
+	USING_SERIALIZATION_VERSION(cellDmuxPamf);
+	ar(cmd_queue); // The queues are contiguous in guest memory, so we only need to save the address of the first one
+	demuxer.save(ar);
+	ar(new_stream);
+}
+
+
 //----------------------------------------------------------------------------
 // PPU
 //----------------------------------------------------------------------------
@@ -1013,32 +1111,11 @@ void DmuxPamfContext::send_spu_command_and_wait(ppu_thread& ppu, bool waiting_fo
 
 DmuxPamfElementaryStream* DmuxPamfContext::find_es(u16 stream_id, u16 private_stream_id)
 {
-	const auto type = dmuxPamfStreamIdToTypeChannel(stream_id, private_stream_id).first;
+	const auto it = dmuxPamfStreamIdToTypeChannel(stream_id, private_stream_id).first == DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO
+		? std::ranges::find_if(elementary_streams | std::views::reverse, [&](const auto& es){ return es && es->stream_id == stream_id; })
+		: std::ranges::find_if(elementary_streams | std::views::reverse, [&](const auto& es){ return es && es->stream_id == stream_id && es->private_stream_id == private_stream_id; });
 
-	DmuxPamfElementaryStream* ret = nullptr;
-
-	if (type == DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO)
-	{
-		for (const vm::bptr<DmuxPamfElementaryStream> es : elementary_streams)
-		{
-			if (es && es->stream_id == stream_id)
-			{
-				ret = es.get_ptr();
-			}
-		}
-	}
-	else
-	{
-		for (const vm::bptr<DmuxPamfElementaryStream> es : elementary_streams)
-		{
-			if (es && es->stream_id == stream_id && es->private_stream_id == private_stream_id)
-			{
-				ret = es.get_ptr();
-			}
-		}
-	}
-
-	return ret;
+	return it != std::ranges::rend(elementary_streams) ? it->get_ptr() : nullptr;
 }
 
 error_code DmuxPamfContext::wait_au_released_or_stream_reset(ppu_thread& ppu, u64 au_queue_full_bitset, b8& stream_reset_started, dmux_pamf_state& savestate)
