@@ -911,56 +911,50 @@ void dmux_pamf_context::operator()() // cellSpursMain()
 			event_queue_was_too_full = event_queue_too_full;
 			event_queue_too_full = false;
 
+			ensure(cmd_result_queue->emplace(static_cast<u32>(cmd.type.value()) + 1));
+
 			switch (cmd.type)
 			{
 			case DmuxPamfCommandType::enable_es:
 				max_enqueued_events += 2;
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::enable_es) + 1));
 				demuxer.enable_es(cmd.enable_es.stream_id, cmd.enable_es.private_stream_id, cmd.enable_es.is_avc, cmd.enable_es.au_queue_buffer_size, cmd.enable_es.au_queue_buffer.get_ptr(), cmd.enable_es.au_max_size, cmd.enable_es.is_raw_es, cmd.enable_es.es_id);
 				break;
 
 			case DmuxPamfCommandType::disable_es:
 				demuxer.disable_es(cmd.disable_flush_es.stream_id, cmd.disable_flush_es.private_stream_id);
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::disable_es) + 1));
 				max_enqueued_events -= 2;
 				break;
 
 			case DmuxPamfCommandType::set_stream:
 				new_stream = true;
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::set_stream) + 1));
 				break;
 
 			case DmuxPamfCommandType::release_au:
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::release_au) + 1));
 				demuxer.release_au(cmd.release_au.au_size, cmd.release_au.stream_id, cmd.release_au.private_stream_id);
 				break;
 
 			case DmuxPamfCommandType::flush_es:
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::flush_es) + 1));
 				demuxer.flush_es(cmd.disable_flush_es.stream_id, cmd.disable_flush_es.private_stream_id);
 				break;
 
 			case DmuxPamfCommandType::close:
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::close) + 1));
 				while (!send_event(DmuxPamfEventType::close)){}
 				return;
 
 			case DmuxPamfCommandType::reset_stream:
 				demuxer.reset_stream();
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::reset_stream) + 1));
 				break;
 
 			case DmuxPamfCommandType::reset_es:
 				demuxer.reset_es(cmd.reset_es.stream_id, cmd.reset_es.private_stream_id, cmd.reset_es.au_addr.get_ptr());
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::reset_es) + 1));
 				break;
 
 			case DmuxPamfCommandType::resume:
-				ensure(cmd_result_queue->emplace(static_cast<u32>(DmuxPamfCommandType::resume) + 1));
 				break;
 
 			default:
-				cmd_result_queue->emplace(1000);
+				cellDmuxPamf.error("Invalid command");
+				return;
 			}
 		}
 		else if (thread_ctrl::state() == thread_state::aborting)

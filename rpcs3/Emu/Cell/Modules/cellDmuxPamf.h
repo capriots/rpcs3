@@ -409,7 +409,7 @@ class dmux_pamf_context
 
 		elementary_stream(dmux_pamf_context& ctx, utils::serial& ar, u32 stream_id, u32 private_stream_id, u32 au_specific_info_size)
 			: ctx(ctx)
-			, state(ar.pop<enum class state>())
+			, state(ar.pop<enum state>())
 			, stream_id(stream_id)
 			, private_stream_id(private_stream_id)
 			, au_specific_info_size(au_specific_info_size)
