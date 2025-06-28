@@ -548,6 +548,27 @@ void dmux_pamf_context::demuxer::flush_es(u32 stream_id, u32 private_stream_id)
 	elementary_streams[type_idx][channel]->flush_es();
 }
 
+void dmux_pamf_context::demuxer::set_stream(const std::span<const std::byte>& stream, bool continuity)
+{
+	if (!continuity)
+	{
+		std::ranges::for_each(elementary_streams | std::views::join | std::views::filter(elementary_stream::is_enabled), &elementary_stream::discard_access_unit);
+	}
+
+	state = state::initial;
+
+	// Not checked on LLE, it would parse old memory contents or uninitialized memory if the size of the input stream set by the user is not a multiple of 0x800.
+	// Valid PAMF streams are always a multiple of 0x800 bytes large.
+	if (stream.size() & 0x7ff)
+	{
+		cellDmuxPamf.warning("Invalid input stream size");
+	}
+
+	input_stream.set_stream(stream);
+	demux_done = false;
+	demux_done_was_notified = false;
+}
+
 void dmux_pamf_context::demuxer::reset_stream()
 {
 	std::ranges::for_each(elementary_streams | std::views::join | std::views::filter(elementary_stream::is_enabled), &elementary_stream::discard_access_unit);
@@ -597,49 +618,11 @@ inline bool dmux_pamf_context::demuxer::check_demux_done()
 }
 
 // TODO logging
-bool dmux_pamf_context::demuxer::demux(const DmuxPamfStreamInfo* stream_info)
+bool dmux_pamf_context::demuxer::demux()
 {
 	if (demux_done)
 	{
-		if (stream_info)
-		{
-			if (!demux_done_was_notified)
-			{
-				ctx.au_queue_full = false;
-
-				if (!ctx.send_event(DmuxPamfEventType::demux_done))
-				{
-					ctx.event_queue_too_full = true;
-					return false;
-				}
-
-				demux_done_was_notified = true;
-				return true;
-			}
-
-			if (!stream_info->continuity)
-			{
-				std::ranges::for_each(elementary_streams | std::views::join | std::views::filter(elementary_stream::is_enabled), &elementary_stream::discard_access_unit );
-			}
-
-			state = state::initial;
-
-			// Not checked on LLE, it would parse old memory contents or uninitialized memory if the size of the input stream set by the user is not a multiple of 0x800.
-			// Valid PAMF streams are always a multiple of 0x800 bytes large.
-			if (stream_info->stream_size & 0x7ff)
-			{
-				cellDmuxPamf.error("Invalid input stream size");
-				return reset_state_and_check_demux_done();
-			}
-
-			input_stream.set_stream({ stream_info->stream_addr.get_ptr(), stream_info->stream_size });
-			demux_done = false;
-			demux_done_was_notified = false;
-		}
-		else
-		{
-			return reset_state_and_check_demux_done();
-		}
+		return reset_state_and_check_demux_done();
 	}
 
 	switch (state)
@@ -892,16 +875,6 @@ bool dmux_pamf_context::send_event(auto&&... args) const
 
 void dmux_pamf_context::operator()() // cellSpursMain()
 {
-	while (!Emu.IsRunning())
-	{
-		thread_ctrl::wait_for(5'000);
-
-		if (thread_ctrl::state() == thread_state::aborting)
-		{
-			return;
-		}
-	}
-
 	DmuxPamfCommand cmd;
 
 	while (thread_ctrl::state() != thread_state::aborting)
@@ -957,11 +930,12 @@ void dmux_pamf_context::operator()() // cellSpursMain()
 				return;
 			}
 		}
-		else if (thread_ctrl::state() == thread_state::aborting)
+		else if (thread_ctrl::state() == thread_state::aborting) // Always demux once after getting a command before creating a savestate
 		{
 			return;
 		}
 
+		// Only set the new stream once the previous one has been entirely consumed
 		if (new_stream && !demuxer.has_work())
 		{
 			new_stream = false;
@@ -969,12 +943,10 @@ void dmux_pamf_context::operator()() // cellSpursMain()
 			DmuxPamfStreamInfo stream_info;
 			ensure(stream_info_queue->pop(stream_info));
 
-			demuxer.demux(&stream_info);
+			demuxer.set_stream({ stream_info.stream_addr.get_ptr(), stream_info.stream_size }, stream_info.continuity);
 		}
-		else
-		{
-			demuxer.demux(nullptr);
-		}
+
+		demuxer.demux();
 	}
 }
 
@@ -1016,24 +988,24 @@ void dmux_pamf_context::demuxer::save(utils::serial& ar)
 		}
 	}
 
-	std::array<bool, 0x10> video_streams_bitset;
-	std::array<bool, 0x10> video_streams_avc_bitset;
-	std::array<bool, 0x10> lpcm_streams_bitset;
-	std::array<bool, 0x10> ac3_streams_bitset;
-	std::array<bool, 0x10> atracx_streams_bitset;
-	std::array<bool, 0x10> user_data_streams_bitset;
+	std::array<bool, 0x10> enabled_video_streams;
+	std::array<bool, 0x10> avc_video_streams;
+	std::array<bool, 0x10> enabled_lpcm_streams;
+	std::array<bool, 0x10> enabled_ac3_streams;
+	std::array<bool, 0x10> enabled_atracx_streams;
+	std::array<bool, 0x10> enabled_user_data_streams;
 
 	if (ar.is_writing())
 	{
-		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO], video_streams_bitset.begin(), elementary_stream::is_enabled);
-		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO], video_streams_avc_bitset.begin(), [](const auto& es){ return !dynamic_cast<video_stream<false>*>(es.get()); });
-		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_LPCM], lpcm_streams_bitset.begin(), elementary_stream::is_enabled);
-		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_AC3], ac3_streams_bitset.begin(), elementary_stream::is_enabled);
-		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX], atracx_streams_bitset.begin(), elementary_stream::is_enabled);
-		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA], user_data_streams_bitset.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO], enabled_video_streams.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO], avc_video_streams.begin(), [](auto& es){ return !dynamic_cast<video_stream<false>*>(es.get()); });
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_LPCM], enabled_lpcm_streams.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_AC3], enabled_ac3_streams.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX], enabled_atracx_streams.begin(), elementary_stream::is_enabled);
+		std::ranges::transform(elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA], enabled_user_data_streams.begin(), elementary_stream::is_enabled);
 	}
 
-	ar(video_streams_bitset, video_streams_avc_bitset, lpcm_streams_bitset, ac3_streams_bitset, atracx_streams_bitset, user_data_streams_bitset);
+	ar(enabled_video_streams, avc_video_streams, enabled_lpcm_streams, enabled_ac3_streams, enabled_atracx_streams, enabled_user_data_streams);
 
 	if (ar.is_writing())
 	{
@@ -1042,26 +1014,46 @@ void dmux_pamf_context::demuxer::save(utils::serial& ar)
 	else
 	{
 		for (u32 ch = 0; ch < 0x10; ch++)
-			if (video_streams_bitset[ch])
-				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO][ch] = video_streams_avc_bitset[ch]
+		{
+			if (enabled_video_streams[ch])
+			{
+				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_VIDEO][ch] = avc_video_streams[ch]
 					? static_cast<std::unique_ptr<elementary_stream>>(std::make_unique<video_stream<true>>(ctx, ar, 0xe0 | ch))
 					: std::make_unique<video_stream<false>>(ctx, ar, 0xe0 | ch);
+			}
+		}
 
 		for (u32 ch = 0; ch < 0x10; ch++)
-			if (lpcm_streams_bitset[ch])
+		{
+			if (enabled_lpcm_streams[ch])
+			{
 				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_LPCM][ch] = std::make_unique<lpcm_stream>(ctx, ar, 0x40 | ch);
+			}
+		}
 
 		for (u32 ch = 0; ch < 0x10; ch++)
-			if (ac3_streams_bitset[ch])
+		{
+			if (enabled_ac3_streams[ch])
+			{
 				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_AC3][ch] = std::make_unique<audio_stream<true>>(ctx, ar, 0x30 | ch);
+			}
+		}
 
 		for (u32 ch = 0; ch < 0x10; ch++)
-			if (atracx_streams_bitset[ch])
+		{
+			if (enabled_atracx_streams[ch])
+			{
 				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_ATRACX][ch] = std::make_unique<audio_stream<false>>(ctx, ar, 0x00 | ch);
+			}
+		}
 
 		for (u32 ch = 0; ch < 0x10; ch++)
-			if (user_data_streams_bitset[ch])
+		{
+			if (enabled_user_data_streams[ch])
+			{
 				elementary_streams[DMUX_PAMF_STREAM_TYPE_INDEX_USER_DATA][ch] = std::make_unique<user_data_stream>(ctx, ar, 0x20 | ch);
+			}
+		}
 	}
 }
 

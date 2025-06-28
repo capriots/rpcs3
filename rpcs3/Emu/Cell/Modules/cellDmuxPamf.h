@@ -298,7 +298,7 @@ class dmux_pamf_context
 			explicit access_unit_queue(const std::span<std::byte>& buffer) : buffer(buffer) {}
 
 			explicit access_unit_queue(utils::serial& ar)
-				: buffer(vm::_ptr<std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>())
+				: buffer{vm::_ptr<std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>()}
 				, back(std::span<std::byte>::iterator(vm::_ptr<std::byte>(ar.pop<vm::addr_t>())))
 				, front(std::span<std::byte>::iterator(vm::_ptr<std::byte>(ar.pop<vm::addr_t>())))
 				, wrap_pos(std::span<std::byte>::iterator(vm::_ptr<std::byte>(ar.pop<vm::addr_t>())))
@@ -414,7 +414,7 @@ class dmux_pamf_context
 			, private_stream_id(private_stream_id)
 			, au_specific_info_size(au_specific_info_size)
 			, es_id(ar.pop<u32>())
-			, current_stream_chunk(vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>())
+			, current_stream_chunk{vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>()}
 			, pts(ar.pop<u64>())
 			, dts(ar.pop<u64>())
 			, rap(ar.pop<bool>())
@@ -422,10 +422,11 @@ class dmux_pamf_context
 			, au_max_size(ar.pop<u32>())
 			, au_size_unk(ar.pop<u32>())
 			, current_au(ar.pop<access_unit>())
-			, au_chunk(state != state::pushing_au_queue ? access_unit_chunk() : access_unit_chunk(ar.pop<std::vector<std::byte>>(), std::span(vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>())))
+			, au_chunk(state != state::pushing_au_queue ? access_unit_chunk() : access_unit_chunk{ar.pop<std::vector<std::byte>>(), std::span{vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>()}})
 			, cache(current_au.state == access_unit::state::complete ? std::vector<std::byte>() : ar.pop<std::vector<std::byte>>())
 		{
 		}
+
 
 		void save(utils::serial& ar);
 
@@ -550,7 +551,7 @@ class dmux_pamf_context
 				pos = stream.begin();
 			}
 
-			bool eof() const { return pos == stream.end(); }
+			bool eof() const { return pos >= stream.end(); }
 
 			std::span<const std::byte, PACK_SIZE> get_next_pack()
 			{
@@ -614,11 +615,12 @@ class dmux_pamf_context
 		void disable_es(u32 stream_id, u32 private_stream_id);
 		void release_au(u32 au_size, u32 stream_id, u32 private_stream_id) const;
 		void flush_es(u32 stream_id, u32 private_stream_id);
+		void set_stream(const std::span<const std::byte>& stream, bool continuity);
 		void reset_stream();
 		void reset_es(u32 stream_id, u32 private_stream_id, std::byte* au_addr);
 
 		// Demultiplexes the next pack
-		bool demux(const DmuxPamfStreamInfo* stream_info);
+		bool demux();
 	};
 
 
