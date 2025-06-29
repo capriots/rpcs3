@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ranges>
+
 // Replacement for CellSpursQueue
 template <typename T, u32 max_num_of_entries> requires(std::is_trivial_v<T> && max_num_of_entries > 0)
 class alignas(0x80) dmux_pamf_hle_spurs_queue
@@ -305,9 +307,8 @@ class dmux_pamf_context
 			{
 			}
 
-			void wrap();
 			void pop_back(u32 au_size);
-			void pop_back(std::span<std::byte>::iterator au_pos);
+			void pop_back(std::span<std::byte>::iterator au_begin);
 			void pop_front(u32 au_size);
 			void push(const access_unit_chunk& au_chunk);
 		};
@@ -351,7 +352,7 @@ class dmux_pamf_context
 		const u8 au_specific_info_size;
 		const u32 es_id; // Unique id received by the PPU thread when enabling the elementary stream
 
-		std::span<const std::byte> current_stream_chunk;
+		std::span<const std::byte> stream;
 		u64 pts = umax;
 		u64 dts = umax;
 		bool rap = false;
@@ -360,10 +361,11 @@ class dmux_pamf_context
 
 	protected:
 		const u32 au_max_size;
-		u32 au_size_unk = 0;          // For user data streams, used to store the size of the current access unit indicated in the stream header. For other private streams, used as a flag
+		u32 au_size_unk = 0;                                              // For user data streams, used to store the size of the current access unit indicated in the stream header. For other private streams, used as a flag
+		alignas(0x10) std::array<std::byte, 0x10> au_specific_info_buf{}; // Specific info like number of channels for LPCM, contained in the stream header
 		access_unit current_au;
 		access_unit_chunk au_chunk;
-		std::vector<std::byte> cache; // The last three bytes of the current stream chunk need to be saved, since they could contain part of the access unit delimiter
+		std::vector<std::byte> cache;                                     // The last three bytes of the current stream chunk need to be saved, since they could contain part of the access unit delimiter
 
 	private:
 		// Extracts access units from the stream by searching for the access unit delimiter and setting au_chunk accordingly. Returns the number of bytes that were parsed
@@ -414,13 +416,14 @@ class dmux_pamf_context
 			, private_stream_id(private_stream_id)
 			, au_specific_info_size(au_specific_info_size)
 			, es_id(ar.pop<u32>())
-			, current_stream_chunk{vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>()}
+			, stream{vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>()}
 			, pts(ar.pop<u64>())
 			, dts(ar.pop<u64>())
 			, rap(ar.pop<bool>())
 			, au_queue(ar)
 			, au_max_size(ar.pop<u32>())
 			, au_size_unk(ar.pop<u32>())
+			, au_specific_info_buf(ar.pop<std::array<std::byte, 0x10>>())
 			, current_au(ar.pop<access_unit>())
 			, au_chunk(state != state::pushing_au_queue ? access_unit_chunk() : access_unit_chunk{ar.pop<std::vector<std::byte>>(), std::span{vm::_ptr<const std::byte>(ar.pop<vm::addr_t>()), ar.pop<u32>()}})
 			, cache(current_au.state == access_unit::state::complete ? std::vector<std::byte>() : ar.pop<std::vector<std::byte>>())
@@ -439,7 +442,7 @@ class dmux_pamf_context
 		bool process_stream();
 
 		static bool is_enabled(const std::unique_ptr<elementary_stream>& es) { return !!es; }
-		void set_stream(const std::span<const std::byte>& stream) { this->current_stream_chunk = stream; }
+		void set_stream(const std::span<const std::byte>& stream) { this->stream = stream; }
 		void set_pts(u64 pts) { this->pts = pts; }
 		void set_dts(u64 dts) { this->dts = dts; }
 		void set_rap() { rap = true; }
@@ -475,8 +478,6 @@ class dmux_pamf_context
 
 	struct lpcm_stream : elementary_stream
 	{
-		alignas(0x10) std::array<std::byte, 0x10> au_specific_info_buf{};
-
 		lpcm_stream(dmux_pamf_context& ctx, u32 stream_id, u32 private_stream_id, u32 es_id, std::byte* au_queue_buffer, u32 au_queue_buffer_size, u32 au_max_size)
 			: elementary_stream(ctx, stream_id, private_stream_id, es_id, 3, au_queue_buffer, au_queue_buffer_size, au_max_size) {}
 		lpcm_stream(dmux_pamf_context& ctx, utils::serial& ar, u32 private_stream_id) : elementary_stream(ctx, ar, 0xbd, private_stream_id, 3) {}
@@ -599,8 +600,7 @@ class dmux_pamf_context
 		u8 es_type_idx = 0;  // Indicates the type of the elementary stream if raw_es is true (this info is normally part of the MPEG-PS container)
 
 
-		inline bool reset_state_and_check_demux_done();
-		inline bool check_demux_done();
+		inline void notify_demux_done();
 
 	public:
 		explicit demuxer(dmux_pamf_context& ctx) : ctx(ctx) {}
@@ -620,7 +620,7 @@ class dmux_pamf_context
 		void reset_es(u32 stream_id, u32 private_stream_id, std::byte* au_addr);
 
 		// Demultiplexes the next pack
-		bool demux();
+		void demux();
 	};
 
 
@@ -803,20 +803,6 @@ struct CellDmuxPamfSpecificInfo
 {
 	be_t<u32> thisSize;
 	b8 programEndCodeCb;
-};
-
-struct CellDmuxPamfAttr
-{
-	be_t<u32> maxEnabledEsNum;
-	be_t<u32> version;
-	be_t<u32> memSize;
-};
-
-struct CellDmuxPamfEsAttr
-{
-	be_t<u32> auQueueMaxSize;
-	be_t<u32> memSize;
-	be_t<u32> specificInfoSize;
 };
 
 struct CellDmuxPamfResource
