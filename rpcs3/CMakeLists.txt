@@ -200,6 +200,7 @@ if(BUILD_RPCS3_TESTS)
             tests/test_fmt.cpp
             tests/test_simple_array.cpp
             tests/test_address_range.cpp
+            tests/test_dmux_pamf.cpp
     )
 
     target_link_libraries(rpcs3_test
@@ -207,6 +208,7 @@ if(BUILD_RPCS3_TESTS)
             rpcs3_lib
             rpcs3_emu
             GTest::gtest
+            GTest::gmock
     )
 
     target_include_directories(rpcs3_test
